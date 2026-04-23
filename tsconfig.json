@@ -1,0 +1,40 @@
+{
+  "compilerOptions": {
+    "target": "ES2020",
+    // [PATCH-001] CommonJS para compatibilidade com backend (também CJS).
+    // Antes: ESNext + verbatimModuleSyntax. Gerava output com `import ... from './...js'`
+    // que falha em Node 20 quando require-ado por módulo CJS (ERR_REQUIRE_ESM).
+    "module": "CommonJS",
+    "moduleResolution": "node",
+    "outDir": "lib",
+    "declaration": true,
+    "sourceMap": true,
+    "declarationMap": true,
+
+    "lib": ["ES2020", "ESNext.Array", "DOM"],
+    "rootDir": "./src",
+
+    // CJS-compatible: extensões de arquivo resolvidas pelo Node, sem verbatim.
+    "allowImportingTsExtensions": false,
+    "noEmit": true,
+
+    // Type Safety
+    "strict": true,
+    "strictNullChecks": true,
+    "noFallthroughCasesInSwitch": true,
+    "noUncheckedIndexedAccess": true,
+    "noImplicitThis": true,
+    "forceConsistentCasingInFileNames": true,
+    "skipLibCheck": true,
+
+    // Interop — `esModuleInterop` é essencial pra `import foo from 'cjs-module'` funcionar em TS.
+    "esModuleInterop": true,
+    "resolveJsonModule": true,
+
+    // DX Boosters
+    "allowJs": false,
+    "checkJs": false,
+  },
+  "include": ["src/**/*.ts"],
+  "exclude": ["node_modules"]
+}

@@ -1,0 +1,29 @@
+# @impzapp/wa-core — gitignore
+# Base herdada do upstream WhiskeySockets/Baileys + ajustes nossos.
+
+# Build output (gerado via `npm run build`)
+lib/
+docs/
+
+# Node
+node_modules/
+
+# OS / editor
+.DS_Store
+*/.DS_Store
+.env
+
+# Artefatos de teste / debug do Baileys
+auth_info*
+baileys_auth_info*
+baileys_store*.json
+browser-messages.json
+browser-token.json
+decoded-ws.json
+messages*.json
+output.csv
+Proxy
+test.ts
+TestData
+wa-logs.txt
+*.tgz
