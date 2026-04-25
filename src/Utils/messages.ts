@@ -215,9 +215,16 @@ export const prepareWAMessageMedia = async (
 	const requiresDurationComputation = mediaType === 'audio' && typeof uploadData.seconds === 'undefined'
 	const requiresThumbnailComputation =
 		(mediaType === 'image' || mediaType === 'video') && typeof uploadData['jpegThumbnail'] === 'undefined'
-	const requiresWaveformProcessing = mediaType === 'audio' && uploadData.ptt === true
+	// [PATCH-008] Antes era `audio && ptt === true` — sobrescrevia a waveform
+	// passada pelo caller, fazendo `getAudioWaveform(originalFilePath!)` rodar
+	// sempre. Com `audio-decode` ausente / sem suporte a OGG/Opus, o resultado
+	// silencia em catch e o proto vai sem waveform → balão sem ondas no
+	// destinatário. Agora respeita a waveform já fornecida.
+	const requiresWaveformProcessing = mediaType === 'audio' && uploadData.ptt === true && typeof uploadData.waveform === 'undefined'
 	const requiresAudioBackground = options.backgroundColor && mediaType === 'audio' && uploadData.ptt === true
-	const requiresOriginalForSomeProcessing = requiresDurationComputation || requiresThumbnailComputation
+	// `requiresOriginalForSomeProcessing` precisa incluir waveform também — se
+	// caímos no caminho de gerar waveform, precisamos do original em disco.
+	const requiresOriginalForSomeProcessing = requiresDurationComputation || requiresThumbnailComputation || requiresWaveformProcessing
 	const { mediaKey, encFilePath, originalFilePath, fileEncSha256, fileSha256, fileLength } = await encryptedStream(
 		uploadData.media,
 		options.mediaTypeOverride || mediaType,
