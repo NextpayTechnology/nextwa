@@ -3,6 +3,7 @@ import { inflate } from 'zlib'
 import { proto } from '../../WAProto/index.js'
 import type { Chat, Contact, WAMessage } from '../Types'
 import { WAMessageStubType } from '../Types'
+import { isLidUser, isPnUser } from '../WABinary'
 import { toNumber } from './generics'
 import { normalizeMessageContent } from './messages'
 import { downloadContentFromMessage } from './messages-media'
@@ -25,10 +26,18 @@ export const downloadHistory = async (msg: proto.Message.IHistorySyncNotificatio
 	return syncData
 }
 
+// [PATCH-016] LID-PN pair shape pra que callers persistam em `lidMapping` store.
+// Antes só populávamos via mensagens individuais (process-message LID_MIGRATION_MAPPING_SYNC),
+// perdendo ~5% dos contatos com device migration recente cujos pares só vêm em
+// `Conversation` no history sync. Aqui extraímos e devolvemos pro caller decidir.
+export type LIDPNPair = { lid: string; pn: string }
+
 export const processHistoryMessage = (item: proto.IHistorySync) => {
 	const messages: WAMessage[] = []
 	const contacts: Contact[] = []
 	const chats: Chat[] = []
+	// [PATCH-016] pares acumulados durante varredura de conversations
+	const lidPnPairs: LIDPNPair[] = []
 
 	switch (item.syncType) {
 		case proto.HistorySync.HistorySyncType.INITIAL_BOOTSTRAP:
@@ -42,6 +51,13 @@ export const processHistoryMessage = (item: proto.IHistorySync) => {
 					lid: chat.lidJid || undefined,
 					phoneNumber: chat.pnJid || undefined
 				})
+
+				// [PATCH-016] Extrai par LID↔PN quando ambos vêm na conversation.
+				// Filtra por sufixo correto pra defender contra payloads malformados
+				// (server às vezes manda jid bruto sem `@lid`/`@s.whatsapp.net`).
+				if (chat.lidJid && chat.pnJid && isLidUser(chat.lidJid) && isPnUser(chat.pnJid)) {
+					lidPnPairs.push({ lid: chat.lidJid, pn: chat.pnJid })
+				}
 
 				const msgs = chat.messages || []
 				delete chat.messages
@@ -87,6 +103,9 @@ export const processHistoryMessage = (item: proto.IHistorySync) => {
 		chats,
 		contacts,
 		messages,
+		// [PATCH-016] callers podem persistir esses pares em `signalRepository.lidMapping`
+		// pra evitar primeira-campanha-pós-pareamento bater em LID errado.
+		lidPnPairs,
 		syncType: item.syncType,
 		progress: item.progress
 	}

@@ -16,6 +16,8 @@ import {
 	aggregateMessageKeysNotFromMe,
 	assertMediaContent,
 	bindWaitForEvent,
+	// [PATCH-009] tc-token utilities — emissão semanal + LID resolve + expiry math.
+	buildMergedTcTokenIndexWrite,
 	decryptMediaRetryData,
 	encodeNewsletterMessage,
 	encodeSignedDeviceIdentity,
@@ -29,10 +31,15 @@ import {
 	getStatusCodeForMediaRetry,
 	getUrlFromDirectPath,
 	getWAUploadToServer,
+	isTcTokenExpired,
 	MessageRetryManager,
 	normalizeMessageContent,
 	parseAndInjectE2ESessions,
+	resolveIssuanceJid,
+	resolveTcTokenJid,
 	shouldIncludeReportingToken,
+	shouldSendNewTcToken,
+	storeTcTokensFromIqResult,
 	unixTimestampSeconds
 } from '../Utils'
 import { getUrlInfo } from '../Utils/link-preview'
@@ -46,13 +53,16 @@ import {
 	getBinaryNodeChildren,
 	isHostedLidUser,
 	isHostedPnUser,
+	isJidBot,
 	isJidGroup,
+	isJidMetaAI,
 	isLidUser,
 	isPnUser,
 	jidDecode,
 	jidEncode,
 	jidNormalizedUser,
 	type JidWithDevice,
+	PSA_WID,
 	S_WHATSAPP_NET
 } from '../WABinary'
 import { USyncQuery, USyncUser } from '../WAUSync'
@@ -82,6 +92,29 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 		groupMetadata,
 		groupToggleEphemeral
 	} = sock
+
+	// [PATCH-009] Helpers e estado pra tc-token sync.
+	//   - getLIDForPN/getPNForLID: usados por resolveTcTokenJid/resolveIssuanceJid
+	//     pra alinhar storage com o pattern de Signal session (LID-first).
+	//   - inFlightTcTokenIssuance: dedup de IQs `issuePrivacyTokens` em flight pra
+	//     o mesmo storageJid — evita spam quando há sends back-to-back.
+	//   - serverProps: AB props do master. NOSSA versão usa defaults seguros
+	//     porque a hierarquia de sockets do nosso fork não casa com o master
+	//     (chats fica acima, não abaixo de messages-send), então não dá pra
+	//     popular via fetchProps do chats.ts sem refator profundo. Os defaults
+	//     baked-in batem com o "happy path" do server: privacyTokenOn1to1=true
+	//     (sempre attach se temos token), profilePicPrivacyToken=true (não usado
+	//     ainda), lidTrustedTokenIssueToLid=false (emite ao PN — comportamento
+	//     conservador). Se WhatsApp rejeitar com SmaxInvalid (479) podemos
+	//     adicionar o gating depois.
+	const getLIDForPN = signalRepository.lidMapping.getLIDForPN.bind(signalRepository.lidMapping)
+	const getPNForLID = signalRepository.lidMapping.getPNForLID.bind(signalRepository.lidMapping)
+	const inFlightTcTokenIssuance = new Set<string>()
+	const serverProps = {
+		privacyTokenOn1to1: true,
+		profilePicPrivacyToken: true,
+		lidTrustedTokenIssueToLid: false
+	}
 
 	const userDevicesCache =
 		config.userDevicesCache ||
@@ -971,12 +1004,46 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 				logger.debug({ jid }, 'adding device identity')
 			}
 
-			const contactTcTokenData =
-				!isGroup && !isRetryResend && !isStatus ? await authState.keys.get('tctoken', [destinationJid]) : {}
+			// [PATCH-009] tc-token attach + fire-and-forget issuance — port direto do
+			// Baileys master (commit 402f479). Mudanças vs versão antiga:
+			//   1) Storage agora indexa em LID (resolveTcTokenJid) — alinha com
+			//      Signal session pattern. JIDs PN antigos no DB ainda funcionam
+			//      pq o resolve tem fallback.
+			//   2) Excluímos peer messages (`category=peer`) e newsletter — server
+			//      rejeita com SmaxInvalid se mandar tctoken pra esses.
+			//   3) Token expirado (>28d via bucket math) é tratado como ausente:
+			//      limpa do cache mas preserva senderTimestamp pra dedupe sobreviver.
+			//   4) AB-prop gate: só attach se `privacyTokenOn1to1` (default true).
+			//   5) NOVO: depois do send, fire-and-forget `issuePrivacyTokens` IQ
+			//      emitindo NOSSO token pro contato. WA Web faz isso semanalmente
+			//      (bucket 7d) — sem isso, o servidor nos identifica como cliente
+			//      "novo" toda hora → fingerprint forte de bot. Esta é a parte que
+			//      a comunidade reportou como causa de "3/4 ban dia".
+			const isPeerMessage = additionalAttributes?.['category'] === 'peer'
+			const is1on1Send = !isGroup && !isRetryResend && !isStatus && !isNewsletter && !isPeerMessage
 
-			const tcTokenBuffer = contactTcTokenData[destinationJid]?.token
+			const tcTokenJid = is1on1Send ? await resolveTcTokenJid(destinationJid, getLIDForPN) : destinationJid
+			const contactTcTokenData = is1on1Send ? await authState.keys.get('tctoken', [tcTokenJid]) : {}
+			const existingTokenEntry = contactTcTokenData[tcTokenJid]
+			let tcTokenBuffer = existingTokenEntry?.token
 
-			if (tcTokenBuffer) {
+			// Token expirado = ausente. Limpa buffer mas mantém senderTimestamp
+			// pra `shouldSendNewTcToken` continuar dedupando emissões.
+			if (tcTokenBuffer?.length && isTcTokenExpired(existingTokenEntry?.timestamp)) {
+				logger.debug({ jid: destinationJid, timestamp: existingTokenEntry?.timestamp }, '[PATCH-009] tctoken expired, clearing')
+				tcTokenBuffer = undefined
+				const cleared =
+					existingTokenEntry?.senderTimestamp !== undefined
+						? { token: Buffer.alloc(0), senderTimestamp: existingTokenEntry.senderTimestamp }
+						: null
+				try {
+					await authState.keys.set({ tctoken: { [tcTokenJid]: cleared } })
+				} catch (err) {
+					logger.debug({ jid: destinationJid, err: String(err) }, '[PATCH-009] failed to persist tctoken expiry cleanup')
+				}
+			}
+
+			if (tcTokenBuffer?.length && serverProps.privacyTokenOn1to1) {
 				;(stanza.content as BinaryNode[]).push({
 					tag: 'tctoken',
 					attrs: {},
@@ -1039,6 +1106,56 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 			logger.debug({ msgId }, `sending message to ${participants.length} devices`)
 
 			await sendNode(stanza)
+
+			// [PATCH-009] Fire-and-forget: emite NOSSO tc-token pro contato APÓS o
+			// send. Esta é a parte central do PATCH — sem ela ficamos só recebendo
+			// passivamente e o servidor nos identifica como cliente "novo".
+			// Skip: protocol messages, PSA, bots, MetaAI (mirror do WA Web
+			// `WAWebSetTcTokenChatAction.isRegularUser`).
+			// Bucket weekly: shouldSendNewTcToken evita reissue dentro do mesmo
+			// bucket de 7d. Dedupe in-flight evita IQs duplicados em sends back-to-back.
+			const isProtocolMsg = !!normalizeMessageContent(message)?.protocolMessage
+			const isBotOrPSA = destinationJid === PSA_WID || isJidBot(destinationJid) || isJidMetaAI(destinationJid)
+			if (
+				is1on1Send &&
+				!isProtocolMsg &&
+				!isBotOrPSA &&
+				shouldSendNewTcToken(existingTokenEntry?.senderTimestamp) &&
+				!inFlightTcTokenIssuance.has(tcTokenJid)
+			) {
+				inFlightTcTokenIssuance.add(tcTokenJid)
+				const issueTimestamp = unixTimestampSeconds()
+				resolveIssuanceJid(destinationJid, serverProps.lidTrustedTokenIssueToLid, getLIDForPN, getPNForLID)
+					.then(issueJid => issuePrivacyTokens([issueJid], issueTimestamp))
+					.then(async result => {
+						await storeTcTokensFromIqResult({
+							result,
+							fallbackJid: tcTokenJid,
+							keys: authState.keys,
+							getLIDForPN
+						})
+
+						const currentData = await authState.keys.get('tctoken', [tcTokenJid])
+						const currentEntry = currentData[tcTokenJid]
+						const indexWrite = await buildMergedTcTokenIndexWrite(authState.keys, [tcTokenJid])
+						await authState.keys.set({
+							tctoken: {
+								[tcTokenJid]: {
+									token: Buffer.alloc(0),
+									...currentEntry,
+									senderTimestamp: issueTimestamp
+								},
+								...indexWrite
+							}
+						})
+					})
+					.catch(err => {
+						logger.debug({ jid: destinationJid, err: String(err) }, '[PATCH-009] fire-and-forget tctoken issuance failed')
+					})
+					.finally(() => {
+						inFlightTcTokenIssuance.delete(tcTokenJid)
+					})
+			}
 
 			// Add message to retry cache if enabled
 			if (messageRetryManager && !participant) {
@@ -1129,6 +1246,42 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 		return result
 	}
 
+	/**
+	 * [PATCH-009] issuePrivacyTokens — variante de getPrivacyTokens que aceita
+	 * timestamp explícito. Usado pela emissão fire-and-forget pra que o `t`
+	 * casado no stanza seja o MESMO usado pra atualizar `senderTimestamp` no
+	 * store (importante pra o bucket weekly não duplicar). Mesmo IQ, mesma
+	 * resposta — poderia ser merged em getPrivacyTokens, mas mantido separado
+	 * pra preservar API existente.
+	 */
+	const issuePrivacyTokens = async (jids: string[], timestamp?: number) => {
+		const t = (timestamp ?? unixTimestampSeconds()).toString()
+		const result = await query({
+			tag: 'iq',
+			attrs: {
+				to: S_WHATSAPP_NET,
+				type: 'set',
+				xmlns: 'privacy'
+			},
+			content: [
+				{
+					tag: 'tokens',
+					attrs: {},
+					content: jids.map(jid => ({
+						tag: 'token',
+						attrs: {
+							jid: jidNormalizedUser(jid),
+							t,
+							type: 'trusted_contact'
+						}
+					}))
+				}
+			]
+		})
+
+		return result
+	}
+
 	const waUploadToServer = getWAUploadToServer(config, refreshMediaConn)
 
 	const waitForMsgMediaUpdate = bindWaitForEvent(ev, 'messages.media-update')
@@ -1136,6 +1289,9 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 	return {
 		...sock,
 		getPrivacyTokens,
+		// [PATCH-009] issuePrivacyTokens exposto pra callers externos (ex.: handler
+		// de identity-change no app, fluxos custom de re-emissão).
+		issuePrivacyTokens,
 		assertSessions,
 		relayMessage,
 		sendReceipt,

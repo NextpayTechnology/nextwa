@@ -80,7 +80,11 @@ export type SignalDataTypeMap = {
 	'app-state-sync-version': LTHashState
 	'lid-mapping': string
 	'device-list': string[]
-	tctoken: { token: Buffer; timestamp?: string }
+	// [PATCH-009] tctoken store ganha `senderTimestamp` (segundos epoch) usado pelo
+	// `shouldSendNewTcToken` pra deduplicar a emissão fire-and-forget do nosso
+	// token pro contato em janelas semanais. Sem isso, a cada send 1:1 reissuaríamos
+	// o token (spam de IQ) ou nunca emitiríamos.
+	tctoken: { token: Buffer; timestamp?: string; senderTimestamp?: number }
 }
 
 export type SignalDataSet = { [T in keyof SignalDataTypeMap]?: { [id: string]: SignalDataTypeMap[T] | null } }

@@ -5,6 +5,11 @@ export type GroupParticipant = Contact & {
 	isAdmin?: boolean
 	isSuperAdmin?: boolean
 	admin?: 'admin' | 'superadmin' | null
+	// [PATCH-015] WA Web/Master adicionou (mar-abr/26) `participant_username` em
+	// notifications de grupo. Carregamos opcionalmente pra não jogar fora — pode
+	// virar required em addressing futuro. Hoje só aparece em accounts com
+	// username pinning ativo, então fica `undefined` na maioria dos casos.
+	username?: string
 }
 
 export type ParticipantAction = 'add' | 'remove' | 'promote' | 'demote' | 'modify'
@@ -56,6 +61,9 @@ export interface GroupMetadata {
 	/** the person who added you to group or changed some setting in group */
 	author?: string
 	authorPn?: string
+	// [PATCH-015] participant_username do acting participant — vide comentário
+	// em GroupParticipant. Forward-compat pra addressing por username.
+	authorUsername?: string
 }
 
 export interface WAGroupCreateResponse {

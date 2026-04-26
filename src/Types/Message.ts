@@ -113,6 +113,10 @@ export interface WAUrlInfo {
 type Mentionable = {
 	/** list of jids that are mentioned in the accompanying text */
 	mentions?: string[]
+	// [PATCH-017] @everyone (groups). Master inclui em PR de mentions regression.
+	// Quando true → server marca como mention-all sem listar JIDs (`nonJidMentions: 1`).
+	/** mention everyone in a group (sets contextInfo.nonJidMentions = 1) */
+	mentionAll?: boolean
 }
 type Contextable = {
 	/** add contextInfo to the message */

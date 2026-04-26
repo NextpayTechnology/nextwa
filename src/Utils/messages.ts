@@ -669,11 +669,19 @@ export const generateWAMessageContent = async (
 	if ('mentions' in message && message.mentions?.length) {
 		const messageType = Object.keys(m)[0]! as Extract<keyof proto.IMessage, MessageWithContextInfo>
 		const key = m[messageType]
+		// [PATCH-017] Inclui `mentionAll` em ambos os branches.
+		// Antes: se a mensagem JÁ tinha contextInfo com outros campos (ex. quoted),
+		// só populávamos `mentionedJid` e ignorávamos `mentionAll` → @everyone sumia.
+		// Master fix em 802d5f6 alinha com WA Web (mentionAll → nonJidMentions=1).
 		if ('contextInfo' in key! && !!key.contextInfo) {
 			key.contextInfo.mentionedJid = message.mentions
+			if (message.mentionAll) {
+				key.contextInfo.nonJidMentions = 1
+			}
 		} else if (key!) {
 			key.contextInfo = {
-				mentionedJid: message.mentions
+				mentionedJid: message.mentions,
+				nonJidMentions: message.mentionAll ? 1 : 0
 			}
 		}
 	}

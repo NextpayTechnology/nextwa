@@ -287,8 +287,24 @@ const processMessage = async (
 
 					const data = await downloadAndProcessHistorySyncNotification(histNotification, options)
 
+					// [PATCH-016] Persiste pares LID↔PN extraídos das conversations do history
+					// no `lidMapping` store ANTES de emitir o event — assim qualquer reaction
+					// downstream a `messaging-history.set` (ex.: store assinador) já encontra
+					// o mapping resolvido. Sem isso, primeira campanha pós-pareamento batia em
+					// LID errado em ~5% dos contatos com device migration recente.
+					if (data.lidPnPairs.length > 0) {
+						try {
+							await signalRepository.lidMapping.storeLIDPNMappings(data.lidPnPairs)
+							logger?.debug({ count: data.lidPnPairs.length }, '[PATCH-016] stored LID-PN pairs from history sync')
+						} catch (err) {
+							logger?.warn({ err }, '[PATCH-016] failed to store history-sync LID-PN pairs')
+						}
+					}
+
+					// `lidPnPairs` é detalhe interno do util — não polui o event público.
+					const { lidPnPairs: _omit, ...emitData } = data
 					ev.emit('messaging-history.set', {
-						...data,
+						...emitData,
 						isLatest: histNotification.syncType !== proto.HistorySync.HistorySyncType.ON_DEMAND ? isLatest : undefined,
 						peerDataRequestSessionId: histNotification.peerDataRequestSessionId
 					})

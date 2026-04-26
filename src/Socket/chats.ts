@@ -817,6 +817,12 @@ export const makeChatsSocket = (config: SocketConfig) => {
 	/** sending non-abt props may fix QR scan fail if server expects */
 	const fetchProps = async () => {
 		//TODO: implement both protocol 1 and protocol 2 prop fetching, specially for abKey for WM
+		// [PATCH-010] hash vazio é REJEITADO pelo server em accounts novos (bad-request).
+		// Antes mandávamos `hash: ''` quando creds.lastPropHash estava undefined — comportamento
+		// herdado do Baileys antigo. Master corrigiu (~abr/26) usando spread condicional pra
+		// só incluir o atributo quando há hash de verdade. Reduz fricção em pareamentos novos
+		// e ataca um padrão de fingerprint (cliente "burro" mandando hash vazio == suspeito).
+		const lastHash = authState?.creds?.lastPropHash
 		const resultNode = await query({
 			tag: 'iq',
 			attrs: {
@@ -829,7 +835,7 @@ export const makeChatsSocket = (config: SocketConfig) => {
 					tag: 'props',
 					attrs: {
 						protocol: '2',
-						hash: authState?.creds?.lastPropHash || ''
+						...(lastHash ? { hash: lastHash } : {})
 					}
 				}
 			]

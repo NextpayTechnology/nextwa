@@ -39,7 +39,18 @@ import {
 	NO_MESSAGE_FOUND_ERROR_TEXT,
 	unixTimestampSeconds,
 	xmppPreKey,
-	xmppSignedPreKey
+	xmppSignedPreKey,
+	// [PATCH-009] tc-token: delegate notification handling pra util compartilhado
+	// (port direto de Baileys master 402f479) — mantém parity com outgoing path
+	// em messages-send.ts e centraliza filtro `isRegularUser`/index merge.
+	buildMergedTcTokenIndexWrite,
+	storeTcTokensFromIqResult,
+	// [PATCH-013] tc-token reissue após identity change requer estes helpers
+	resolveTcTokenJid,
+	resolveIssuanceJid,
+	isTcTokenExpired,
+	// [PATCH-013] identity change handler unificado
+	handleIdentityChange
 } from '../Utils'
 import { makeMutex } from '../Utils/make-mutex'
 import {
@@ -83,7 +94,9 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 		sendReceipt,
 		uploadPreKeys,
 		sendPeerDataOperationMessage,
-		messageRetryManager
+		messageRetryManager,
+		// [PATCH-013] reissue de tc-token após identity change usa esse IQ helper
+		issuePrivacyTokens
 	} = sock
 
 	/** this mutex ensures that each retryRequest will wait for the previous one to finish */
@@ -386,7 +399,11 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 		await query(stanza)
 	}
 
-	const sendRetryRequest = async (node: BinaryNode, forceIncludeKeys = false) => {
+	// [PATCH-012] `skipPlaceholderResend` adicionado pra que callers que detectam
+	// idade > PLACEHOLDER_MAX_AGE possam ainda mandar o retry receipt (estabilidade
+	// signal/session) MAS pulem o PDO de placeholder resend pro phone do dono.
+	// Phone offline + msg antiga = pedido sem resposta = retry-storm.
+	const sendRetryRequest = async (node: BinaryNode, forceIncludeKeys = false, skipPlaceholderResend = false) => {
 		const { fullMessage } = decodeMessageNode(node, authState.creds.me!.id, authState.creds.me!.lid || '')
 		const { key: msgKey } = fullMessage
 		const msgId = msgKey.id!
@@ -449,7 +466,10 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 			}
 		}
 
-		if (retryCount <= 2) {
+		// [PATCH-012] Gate placeholder resend por skipPlaceholderResend (caller decide
+		// com base na idade da msg). Mantemos o retry receipt (Signal session continua
+		// saudável); pulamos só o PDO ao phone que viraria retry-storm em msg antiga.
+		if (retryCount <= 2 && !skipPlaceholderResend) {
 			// Use new retry manager for phone requests if available
 			if (messageRetryManager) {
 				// Schedule phone request with delay (like whatsmeow)
@@ -468,6 +488,8 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 				const msgId = await requestPlaceholderResend(msgKey)
 				logger.debug(`sendRetryRequest: requested placeholder resend for message ${msgId}`)
 			}
+		} else if (skipPlaceholderResend) {
+			logger.debug({ msgId }, '[PATCH-012] skipping placeholder resend (msg too old)')
 		}
 
 		const deviceIdentity = encodeSignedDeviceIdentity(account!, true)
@@ -535,6 +557,50 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 		}, authState?.creds?.me?.id || 'sendRetryRequest')
 	}
 
+	// [PATCH-013] reissueTcTokenAfterIdentityChange — fire-and-forget hook que
+	// re-emite NOSSO tc-token pro peer ANTES do `assertSessions` rodar. Roda só se
+	// já tínhamos um senderTimestamp recente (i.e., já tínhamos relacionamento) —
+	// se nunca emitimos antes, essa não é a hora certa (essa é a janela semanal
+	// natural do send 1:1). Mantém ordem idêntica ao WA Web.
+	const reissueTcTokenAfterIdentityChange = (from: string): void => {
+		void (async () => {
+			const getLIDForPN = signalRepository.lidMapping.getLIDForPN.bind(signalRepository.lidMapping)
+			const getPNForLID = signalRepository.lidMapping.getPNForLID.bind(signalRepository.lidMapping)
+			const normalizedJid = jidNormalizedUser(from)
+			const tcJid = await resolveTcTokenJid(normalizedJid, getLIDForPN)
+			const tcTokenData = await authState.keys.get('tctoken', [tcJid])
+			const senderTs = tcTokenData?.[tcJid]?.senderTimestamp
+
+			if (senderTs === null || senderTs === undefined || isTcTokenExpired(senderTs)) {
+				return
+			}
+
+			logger.debug({ jid: normalizedJid, senderTimestamp: senderTs }, '[PATCH-013] identity changed, re-issuing tctoken')
+			// Mesmo default seguro do PATCH-009 (lidTrustedTokenIssueToLid=false) —
+			// nosso fork ainda não tem AB-prop sourcing dinâmico, então emitimos pro PN.
+			const issueJid = await resolveIssuanceJid(normalizedJid, false, getLIDForPN, getPNForLID)
+			const result = await issuePrivacyTokens([issueJid], senderTs)
+
+			const newJids: string[] = []
+			await storeTcTokensFromIqResult({
+				result,
+				fallbackJid: tcJid,
+				keys: authState.keys as Parameters<typeof storeTcTokensFromIqResult>[0]['keys'],
+				getLIDForPN,
+				onNewJidStored: jid => newJids.push(jid)
+			})
+			if (newJids.length > 0) {
+				const indexWrite = await buildMergedTcTokenIndexWrite(
+					authState.keys as Parameters<typeof buildMergedTcTokenIndexWrite>[0],
+					newJids
+				)
+				await authState.keys.set({ tctoken: indexWrite })
+			}
+		})().catch(err => {
+			logger.debug({ jid: from, err: (err as Error)?.message }, '[PATCH-013] failed to re-issue tctoken after identity change')
+		})
+	}
+
 	const handleEncryptNotification = async (node: BinaryNode) => {
 		const from = node.attrs.from
 		if (from === S_WHATSAPP_NET) {
@@ -547,21 +613,24 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 				await uploadPreKeys()
 			}
 		} else {
-			const identityNode = getBinaryNodeChild(node, 'identity')
-			if (identityNode) {
-				logger.info({ jid: from }, 'identity changed')
-				if (identityAssertDebounce.get(from!)) {
-					logger.debug({ jid: from }, 'skipping identity assert (debounced)')
-					return
-				}
+			// [PATCH-013] Delegate pro util unificado — substitui detecção manual e
+			// `assertSessions` cego por discriminated union com 8 estados:
+			//   - companion device, self-primary → ignora (era retry-storm antes)
+			//   - debounced → respeita TTL como antes
+			//   - sem sessão prévia → não reescreve (antes reescrevia à toa)
+			//   - offline notification → adia até online
+			//   - sessão refrescável → reissue tc-token + assertSessions(force=true)
+			const result = await handleIdentityChange(node, {
+				meId: authState.creds.me?.id,
+				meLid: authState.creds.me?.lid,
+				validateSession: signalRepository.validateSession.bind(signalRepository),
+				assertSessions,
+				debounceCache: identityAssertDebounce,
+				logger,
+				onBeforeSessionRefresh: reissueTcTokenAfterIdentityChange
+			})
 
-				identityAssertDebounce.set(from!, true)
-				try {
-					await assertSessions([from!], true)
-				} catch (error) {
-					logger.warn({ error, jid: from }, 'failed to assert sessions after identity change')
-				}
-			} else {
+			if (result.action === 'no_identity_node') {
 				logger.info({ node }, 'unknown encrypt notification')
 			}
 		}
@@ -572,6 +641,10 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 
 		const actingParticipantLid = fullNode.attrs.participant
 		const actingParticipantPn = fullNode.attrs.participant_pn
+		// [PATCH-015] participant_username — atributo novo do server (mar-abr/26).
+		// Forward-compat: capturamos pra propagar via events `groups.upsert` /
+		// `messageStubParameters`. Não muda comportamento se atributo ausente.
+		const actingParticipantUsername = fullNode.attrs.participant_username
 
 		const affectedParticipantLid = getBinaryNodeChild(child, 'participant')?.attrs?.jid || actingParticipantLid!
 		const affectedParticipantPn = getBinaryNodeChild(child, 'participant')?.attrs?.phone_number || actingParticipantPn!
@@ -595,7 +668,9 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 					{
 						...metadata,
 						author: actingParticipantLid,
-						authorPn: actingParticipantPn
+						authorPn: actingParticipantPn,
+						// [PATCH-015] forward authorUsername quando server enviou
+						authorUsername: actingParticipantUsername
 					}
 				])
 				break
@@ -627,6 +702,9 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 						id: attrs.jid!,
 						phoneNumber: isLidUser(attrs.jid) && isPnUser(attrs.phone_number) ? attrs.phone_number : undefined,
 						lid: isPnUser(attrs.jid) && isLidUser(attrs.lid) ? attrs.lid : undefined,
+						// [PATCH-015] forward username quando server envia. Aceita ambos
+						// `participant_username` e `username` pra cobrir variações de schema.
+						username: attrs.participant_username || attrs.username || undefined,
 						admin: (attrs.type || null) as GroupParticipant['admin']
 					}
 				})
@@ -881,33 +959,37 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 		}
 	}
 
+	// [PATCH-009] handlePrivacyTokenNotification — port direto de Baileys master
+	// (commit 402f479). Antes guardávamos o token sob `node.attrs.from` cru
+	// (mistura PN/LID, sem filtro `isRegularUser`, sem t-monotonic check, sem
+	// índice cross-session). Agora delegamos pra `storeTcTokensFromIqResult`
+	// — o mesmo helper que o IQ result usa — pra ter parity 1:1 com WA Web.
+	// Index merge mantém prune cross-session funcional sem `keys.list()`.
 	const handlePrivacyTokenNotification = async (node: BinaryNode) => {
 		const tokensNode = getBinaryNodeChild(node, 'tokens')
-		const from = jidNormalizedUser(node.attrs.from)
-
 		if (!tokensNode) return
 
-		const tokenNodes = getBinaryNodeChildren(tokensNode, 'token')
+		const from = jidNormalizedUser(node.attrs.from)
+		const getLIDForPN = signalRepository.lidMapping.getLIDForPN.bind(signalRepository.lidMapping)
+		const newJids: string[] = []
 
-		for (const tokenNode of tokenNodes) {
-			const { attrs, content } = tokenNode
-			const type = attrs.type
-			const timestamp = attrs.t
+		// `authState.keys` aqui é a transactional store quando estamos dentro de um
+		// notification handler — `storeTcTokensFromIqResult` requer essa interface.
+		await storeTcTokensFromIqResult({
+			result: node,
+			fallbackJid: from,
+			keys: authState.keys as Parameters<typeof storeTcTokensFromIqResult>[0]['keys'],
+			getLIDForPN,
+			onNewJidStored: jid => newJids.push(jid)
+		})
 
-			if (type === 'trusted_contact' && content instanceof Buffer) {
-				logger.debug(
-					{
-						from,
-						timestamp,
-						tcToken: content
-					},
-					'received trusted contact token'
-				)
-
-				await authState.keys.set({
-					tctoken: { [from]: { token: content, timestamp } }
-				})
-			}
+		if (newJids.length > 0) {
+			logger.debug({ from, count: newJids.length }, '[PATCH-009] stored trusted_contact tokens')
+			const indexWrite = await buildMergedTcTokenIndexWrite(
+				authState.keys as Parameters<typeof buildMergedTcTokenIndexWrite>[0],
+				newJids
+			)
+			await authState.keys.set({ tctoken: indexWrite })
 		}
 	}
 
@@ -1229,6 +1311,44 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 						return sendMessageAck(node)
 					}
 
+					// [PATCH-011] Status-broadcast retry skip — port de Baileys master.
+					// Status do WhatsApp expira em 24h. Retentar status já expirado gera
+					// tempestade de `<receipt type=retry>` que o servidor marca como
+					// suspeito (anti-ban score sobe). Master adicionou esse guard ~mar/26.
+					// Resultado: ack silencioso, sem retry, sem fingerprint negativo.
+					//
+					// [PATCH-012] Placeholder-resend age gate — mesmo princípio aplicado a
+					// QUALQUER ciphertext stub antigo. `requestPlaceholderResend` dispara um
+					// PDO ao phone do dono pedindo redelivery; pra mensagens muito antigas
+					// (CTWAads, history sync atrasado) o phone não vai responder e cada
+					// pedido vira retry-storm. Master gateia por idade desde jan/26.
+					const STATUS_EXPIRY_SECONDS = 24 * 60 * 60 // 24h
+					const PLACEHOLDER_MAX_AGE_SECONDS = 24 * 60 * 60 // 24h — aceita até 1d
+					const nowSec = Math.floor(Date.now() / 1000)
+					const tsRaw = msg.messageTimestamp
+					const tsSec = typeof tsRaw === 'number'
+						? tsRaw
+						: tsRaw && typeof (tsRaw as { toNumber?: () => number }).toNumber === 'function'
+							? (tsRaw as { toNumber: () => number }).toNumber()
+							: 0
+					const ageSec = tsSec > 0 ? nowSec - tsSec : 0
+
+					if (isJidStatusBroadcast(msg.key.remoteJid!) && ageSec > STATUS_EXPIRY_SECONDS) {
+						logger.debug(
+							{ remoteJid: msg.key.remoteJid, ageSec },
+							'[PATCH-011] skip retry on expired status-broadcast (>24h)'
+						)
+						return sendMessageAck(node)
+					}
+
+					const isTooOldForPlaceholder = ageSec > PLACEHOLDER_MAX_AGE_SECONDS
+					if (isTooOldForPlaceholder) {
+						logger.debug(
+							{ msgId: msg.key.id, ageSec },
+							'[PATCH-012] message too old for placeholder resend, will skip phone-request path'
+						)
+					}
+
 					const errorMessage = msg?.messageStubParameters?.[0] || ''
 					const isPreKeyError = errorMessage.includes('PreKey')
 
@@ -1257,7 +1377,8 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 							}
 
 							const encNode = getBinaryNodeChild(node, 'enc')
-							await sendRetryRequest(node, !encNode)
+							// [PATCH-012] propaga age gate pro retry path
+							await sendRetryRequest(node, !encNode, isTooOldForPlaceholder)
 							if (retryRequestDelayMs) {
 								await delay(retryRequestDelayMs)
 							}
@@ -1266,7 +1387,7 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 							// Still attempt retry even if pre-key upload failed
 							try {
 								const encNode = getBinaryNodeChild(node, 'enc')
-								await sendRetryRequest(node, !encNode)
+								await sendRetryRequest(node, !encNode, isTooOldForPlaceholder)
 							} catch (retryErr) {
 								logger.error({ retryErr }, 'Failed to send retry after error handling')
 							}
@@ -1383,7 +1504,32 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 		// error in acknowledgement,
 		// device could not display the message
 		if (attrs.error) {
-			logger.warn({ attrs }, 'received error in ack')
+			// [PATCH-014] Error code routing — port de Baileys master.
+			// Antes emitíamos `messages.update` cego em qualquer ack com error,
+			// que em accounts restritas vira loop (caller tenta retry → mais 463).
+			// Master separou:
+			//   463 (MissingTcToken): account restrito ou sem tctoken pro contato.
+			//     WA Web previne client-side (desabilita compose bar). NÃO retentar
+			//     — retry conta como mais um "reach out" e piora restrição.
+			//   479 (smax-invalid): stanza rejeitado pelo server — sessão stale
+			//     ou addressing malformado. NÃO retentar nesta camada — caller
+			//     decide se vale assertSessions+resend.
+			const SERVER_ERROR_MISSING_TCTOKEN = '463'
+			const SERVER_ERROR_SMAX_INVALID = '479'
+			if (attrs.error === SERVER_ERROR_MISSING_TCTOKEN) {
+				logger.warn(
+					{ msgId: attrs.id, from: attrs.from },
+					'[PATCH-014] error 463: account restricted or missing tctoken for contact'
+				)
+			} else if (attrs.error === SERVER_ERROR_SMAX_INVALID) {
+				logger.warn(
+					{ msgId: attrs.id, from: attrs.from },
+					'[PATCH-014] smax-invalid (479): stanza rejected — likely stale device session or malformed addressing'
+				)
+			} else {
+				logger.warn({ attrs }, 'received error in ack')
+			}
+
 			ev.emit('messages.update', [
 				{
 					key,
