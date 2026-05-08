@@ -15,6 +15,7 @@ import type {
 import {
 	aggregateMessageKeysNotFromMe,
 	assertMediaContent,
+	assertMeId,
 	bindWaitForEvent,
 	// [PATCH-009] tc-token utilities — emissão semanal + LID resolve + expiry math.
 	buildMergedTcTokenIndexWrite,
@@ -90,7 +91,9 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 		fetchPrivacySettings,
 		sendNode,
 		groupMetadata,
-		groupToggleEphemeral
+		groupToggleEphemeral,
+		// [PATCH-021] cherry-pick Baileys 3730684e — registry de cleanup pós-end
+		registerSocketEndHandler
 	} = sock
 
 	// [PATCH-009] Helpers e estado pra tc-token sync.
@@ -134,8 +137,10 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 	// Prevent race conditions in Signal session encryption by user
 	const encryptionMutex = makeKeyedMutex()
 
-	let mediaConn: Promise<MediaConnInfo>
-	const refreshMediaConn = async (forceGet = false) => {
+	// [PATCH-021] cherry-pick Baileys 3730684e — nullable pra que end handler possa
+	// limpar a ref. `refreshMediaConn` re-cria sob demanda (idempotente).
+	let mediaConn: Promise<MediaConnInfo> | undefined
+	const refreshMediaConn = async (forceGet = false): Promise<MediaConnInfo> => {
 		const media = await mediaConn
 		if (!media || forceGet || new Date().getTime() - media.fetchDate.getTime() > media.ttl * 1000) {
 			mediaConn = (async () => {
@@ -164,7 +169,7 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 			})()
 		}
 
-		return mediaConn
+		return mediaConn!
 	}
 
 	/**
@@ -636,7 +641,8 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 			statusJidList
 		}: MessageRelayOptions
 	) => {
-		const meId = authState.creds.me!.id
+		// [PATCH-019] cherry-pick Baileys 798f2a93 — fail-fast helper se socket cair antes de auth completar
+		const meId = assertMeId(authState.creds)
 		const meLid = authState.creds.me?.lid
 		const isRetryResend = Boolean(participant?.jid)
 		let shouldIncludeDeviceIdentity = isRetryResend
@@ -1285,6 +1291,27 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 	const waUploadToServer = getWAUploadToServer(config, refreshMediaConn)
 
 	const waitForMsgMediaUpdate = bindWaitForEvent(ev, 'messages.media-update')
+
+	// [PATCH-021] cherry-pick Baileys 3730684e — release caches no socket-end:
+	//   - userDevicesCache (5min TTL): só fechamos se a config não passou um cache externo
+	//     (caso contrário caller é dono da memória).
+	//   - peerSessionsCache: sempre interno, fecha sempre.
+	//   - mediaConn: undefined pra que o próximo dispatch crie nova promise.
+	//   - messageRetryManager: clear() limpa LRUs internos (PATCH-021 helper).
+	registerSocketEndHandler(() => {
+		if (!config.userDevicesCache && userDevicesCache.close) {
+			userDevicesCache.close()
+		}
+
+		if (peerSessionsCache.close) {
+			peerSessionsCache.close()
+		}
+
+		mediaConn = undefined
+		if (messageRetryManager) {
+			messageRetryManager.clear()
+		}
+	})
 
 	return {
 		...sock,

@@ -226,4 +226,29 @@ export class MessageRetryManager {
 		this.recentMessagesMap.delete(keyStr)
 		this.messageKeyIndex.delete(messageId)
 	}
+
+	/**
+	 * [PATCH-021] cherry-pick Baileys 3730684e — clear all retry state.
+	 * Chamado pelo socket-end handler em messages-send pra liberar caches em
+	 * memória quando o socket fecha. Adapter: nosso fork não tem `baseKeys`
+	 * (campo mais novo no master), então pulamos esse clear.
+	 */
+	clear(): void {
+		this.recentMessagesMap.clear()
+		this.messageKeyIndex.clear()
+		this.sessionRecreateHistory.clear()
+		this.retryCounters.clear()
+		for (const messageId of Object.keys(this.pendingPhoneRequests)) {
+			this.cancelPendingPhoneRequest(messageId)
+		}
+
+		this.statistics = {
+			totalRetries: 0,
+			successfulRetries: 0,
+			failedRetries: 0,
+			mediaRetries: 0,
+			sessionRecreations: 0,
+			phoneRequests: 0
+		}
+	}
 }

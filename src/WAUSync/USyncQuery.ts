@@ -46,7 +46,8 @@ export class USyncQuery {
 	}
 
 	parseUSyncQueryResult(result: BinaryNode | undefined): USyncQueryResult | undefined {
-		if (!result || result.attrs.type !== 'result') {
+		// [PATCH-020] cherry-pick Baileys 0956f51f — simplificação null-safe
+		if (result?.attrs.type !== 'result') {
 			return
 		}
 

@@ -227,11 +227,21 @@ export const decodeSyncdMutations = async (
 		if (validateMacs) {
 			const contentHmac = generateMac(operation!, encContent, record.keyId!.id!, key.valueMacKey)
 			if (Buffer.compare(contentHmac, ogValueMac) !== 0) {
-				throw new Boom('HMAC content verification failed')
+				// [PATCH-020] cherry-pick Baileys 0956f51f — record-level resilience.
+				// Antes throw aqui derrubava o decode inteiro do snapshot (~30 records
+				// poisoned por 1 corrupted). Agora skip o record e segue.
+				continue
 			}
 		}
 
-		const result = aesDecrypt(encContent, key.valueEncryptionKey)
+		// [PATCH-020] AES decrypt resilience — record com ciphertext malformado
+		// (server-side bug, replication race) também é skip-and-continue.
+		let result: Uint8Array
+		try {
+			result = aesDecrypt(encContent, key.valueEncryptionKey)
+		} catch {
+			continue
+		}
 		const syncAction = proto.SyncActionData.decode(result)
 
 		if (validateMacs) {
@@ -374,7 +384,8 @@ export const decodeSyncdSnapshot = async (
 	snapshot: proto.ISyncdSnapshot,
 	getAppStateSyncKey: FetchAppStateSyncKey,
 	minimumVersionNumber: number | undefined,
-	validateMacs = true
+	validateMacs = true,
+	logger?: ILogger
 ) => {
 	const newState = newLTHashState()
 	newState.version = toNumber(snapshot.version!.version)
@@ -407,7 +418,15 @@ export const decodeSyncdSnapshot = async (
 		const result = await mutationKeys(keyEnc.keyData!)
 		const computedSnapshotMac = generateSnapshotMac(newState.hash, newState.version, name, result.snapshotMacKey)
 		if (Buffer.compare(snapshot.mac!, computedSnapshotMac) !== 0) {
-			throw new Boom(`failed to verify LTHash at ${newState.version} of ${name} from snapshot`)
+			// [PATCH-020] cherry-pick Baileys 0956f51f — soft-fail. Quando
+			// decodeSyncdMutations skipou records corrompidos (poisoned snapshot
+			// server-side), o LTHash agregado diverge do mac server. Antes throw
+			// aqui matava todo o snapshot; agora warn + segue com partial state
+			// (simétrico ao tratamento em decodePatches).
+			logger?.warn(
+				{ name, version: newState.version },
+				'LTHash verification failed on snapshot, continuing with partial state'
+			)
 		}
 	}
 
@@ -448,19 +467,28 @@ export const decodePatches = async (
 		newState.version = patchVersion
 		const shouldMutate = typeof minimumVersionNumber === 'undefined' || patchVersion > minimumVersionNumber
 
-		const decodeResult = await decodeSyncdPatch(
-			syncd,
-			name,
-			newState,
-			getAppStateSyncKey,
-			shouldMutate
-				? mutation => {
-						const index = mutation.syncAction.index?.toString()
-						mutationMap[index!] = mutation
-					}
-				: () => {},
-			true
-		)
+		// [PATCH-020] cherry-pick Baileys 0956f51f — patch-level resilience.
+		// Antes throw em decodeSyncdPatch parava sync de tudo na frente. Agora
+		// pula o patch corrompido e segue. validateMacs propagado em vez de hardcoded.
+		let decodeResult: { hash: Buffer; indexValueMap: LTHashState['indexValueMap'] }
+		try {
+			decodeResult = await decodeSyncdPatch(
+				syncd,
+				name,
+				newState,
+				getAppStateSyncKey,
+				shouldMutate
+					? mutation => {
+							const index = mutation.syncAction.index?.toString()
+							mutationMap[index!] = mutation
+						}
+					: () => {},
+				validateMacs
+			)
+		} catch (err) {
+			logger?.warn({ name, version: patchVersion, error: (err as Error).message }, 'failed to decode patch, skipping')
+			continue
+		}
 
 		newState.hash = decodeResult.hash
 		newState.indexValueMap = decodeResult.indexValueMap
@@ -475,7 +503,10 @@ export const decodePatches = async (
 			const result = await mutationKeys(keyEnc.keyData!)
 			const computedSnapshotMac = generateSnapshotMac(newState.hash, newState.version, name, result.snapshotMacKey)
 			if (Buffer.compare(snapshotMac!, computedSnapshotMac) !== 0) {
-				throw new Boom(`failed to verify LTHash at ${newState.version} of ${name}`)
+				// [PATCH-020] LTHash mismatch: warn + abort sync de patches restantes
+				// (em vez de throw) — preserva state acumulado até aqui.
+				logger?.warn({ name, version: newState.version }, 'LTHash verification failed, skipping remaining patches')
+				break
 			}
 		}
 

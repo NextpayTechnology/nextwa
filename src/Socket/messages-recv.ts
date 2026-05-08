@@ -95,6 +95,8 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 		uploadPreKeys,
 		sendPeerDataOperationMessage,
 		messageRetryManager,
+		// [PATCH-021] cherry-pick Baileys 3730684e — registry de cleanup pós-end
+		registerSocketEndHandler,
 		// [PATCH-013] reissue de tc-token após identity change usa esse IQ helper
 		issuePrivacyTokens
 	} = sock
@@ -1695,6 +1697,24 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 			sendActiveReceipts = isOnline
 			logger.trace(`sendActiveReceipts set to "${sendActiveReceipts}"`)
 		}
+	})
+
+	// [PATCH-021] cherry-pick Baileys 3730684e — release caches no socket-end:
+	//   - msgRetryCache (1h TTL): só fechamos se a config não passou um cache externo
+	//   - callOfferCache (idem)
+	//   - identityAssertDebounce: sempre interno
+	//   - sendActiveReceipts: reset pra reconnect ressincronizar status
+	registerSocketEndHandler(() => {
+		if (!config.msgRetryCounterCache && msgRetryCache.close) {
+			msgRetryCache.close()
+		}
+
+		if (!config.callOfferCache && callOfferCache.close) {
+			callOfferCache.close()
+		}
+
+		identityAssertDebounce.close()
+		sendActiveReceipts = false
 	})
 
 	return {

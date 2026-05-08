@@ -206,4 +206,13 @@ export class LIDMappingStore {
 		this.logger.trace(`Found reverse mapping: ${lid} → ${pnJid}`)
 		return pnJid
 	}
+
+	/**
+	 * [PATCH-021] cherry-pick Baileys 3730684e — close the cache and release resources
+	 * no socket-end handler. Sem isso, mantemos refs ao LRU em memória mesmo após
+	 * o socket fechar (leak quando reconnect cria nova store).
+	 */
+	close(): void {
+		this.mappingCache.clear()
+	}
 }

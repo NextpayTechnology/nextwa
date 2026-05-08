@@ -364,6 +364,14 @@ export const makeSocket = (config: SocketConfig) => {
 	let qrTimer: NodeJS.Timeout
 	let closed = false
 
+	/**
+	 * [PATCH-021] cherry-pick Baileys 3730684e — registry de end handlers.
+	 * Cada subsistema (chats, messages-recv, messages-send) registra um cleanup
+	 * que roda no `end()` antes do close final. Centraliza o cleanup e evita
+	 * memory leak de caches por instância em ambiente multi-tenant.
+	 */
+	const socketEndHandlers: Array<(error: Error | undefined) => void | Promise<void>> = []
+
 	/** log & process any unexpected errors */
 	const onUnexpectedError = (err: Error | Boom, msg: string) => {
 		logger.error({ err }, `unexpected error in '${msg}'`)
@@ -605,7 +613,7 @@ export const makeSocket = (config: SocketConfig) => {
 		})
 	}
 
-	const end = (error: Error | undefined) => {
+	const end = async (error: Error | undefined) => {
 		if (closed) {
 			logger.trace({ trace: error?.stack }, 'connection already closed')
 			return
@@ -621,10 +629,26 @@ export const makeSocket = (config: SocketConfig) => {
 		ws.removeAllListeners('open')
 		ws.removeAllListeners('message')
 
+		// [PATCH-021] cherry-pick Baileys 3730684e — release signal repository caches.
+		// Antes do close final do ws pra que reconnect que dispare logo após não veja
+		// LIDMappingStore órfão referenciando a sessão velha.
+		signalRepository.close?.()
+
 		if (!ws.isClosed && !ws.isClosing) {
 			try {
 				ws.close()
 			} catch {}
+		}
+
+		// [PATCH-021] cherry-pick Baileys 3730684e — roda cleanup handlers registrados
+		// pelos subsistemas (chats/messages-recv/messages-send). Tolerante a erro
+		// individual — log mas não derruba o end().
+		for (const handler of socketEndHandlers) {
+			try {
+				await handler(error)
+			} catch (err) {
+				logger.error({ err }, 'error in socket end handler')
+			}
 		}
 
 		ev.emit('connection.update', {
@@ -635,6 +659,8 @@ export const makeSocket = (config: SocketConfig) => {
 			}
 		})
 		ev.removeAllListeners('connection.update')
+		// [PATCH-021] cherry-pick Baileys 3730684e — destroi event buffer (timer + cache + listeners)
+		ev.destroy()
 	}
 
 	const waitForSocketOpen = async () => {
@@ -1046,6 +1072,10 @@ export const makeSocket = (config: SocketConfig) => {
 		sendNode,
 		logout,
 		end,
+		// [PATCH-021] cherry-pick Baileys 3730684e — exposed pra subsistemas registrarem cleanup
+		registerSocketEndHandler: (handler: (error: Error | undefined) => void | Promise<void>) => {
+			socketEndHandlers.push(handler)
+		},
 		onUnexpectedError,
 		uploadPreKeys,
 		uploadPreKeysToServerIfRequired,

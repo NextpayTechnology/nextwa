@@ -184,6 +184,16 @@ export function makeLibSignalRepository(
 			}, `delete-${jids.length}-sessions`)
 		},
 
+		/**
+		 * [PATCH-021] cherry-pick Baileys 3730684e — release in-memory caches no
+		 * socket-end. Mantém memória limpa quando socket cai e reconnect spinning
+		 * cria nova repository — sem isso, cada reconnect deixava LRU + Map órfãos.
+		 */
+		close() {
+			migratedSessionCache.clear()
+			lidMapping.close()
+		},
+
 		async migrateSession(
 			fromJid: string,
 			toJid: string

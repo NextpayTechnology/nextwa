@@ -19,6 +19,8 @@ export type CacheStore = {
 	del(key: string): void | Promise<void> | number | boolean
 	/** flush all data */
 	flushAll(): void | Promise<void>
+	/** [PATCH-021] cherry-pick Baileys 3730684e — close hook usado pelo cleanup pós-socket-end pra liberar recursos */
+	close?: () => void
 }
 
 export type PossiblyExtendedCacheStore = CacheStore & {

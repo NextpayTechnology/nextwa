@@ -1,4 +1,5 @@
 import NodeCache from '@cacheable/node-cache'
+import { Boom } from '@hapi/boom'
 import { AsyncLocalStorage } from 'async_hooks'
 import { Mutex } from 'async-mutex'
 import { randomBytes } from 'crypto'
@@ -304,6 +305,21 @@ export const addTransactionCapability = (
 			})
 		}
 	}
+}
+
+/**
+ * [PATCH-019] cherry-pick Baileys 798f2a93 — fail-fast helper.
+ * Returns the authenticated user's JID, or throws Boom-401 if creds aren't ready.
+ * Use anywhere we'd otherwise reach for `creds.me!.id` to get a descriptive error
+ * em vez de TypeError opaco quando socket cai antes do auth completar.
+ */
+export const assertMeId = (creds: AuthenticationCreds): string => {
+	const id = creds.me?.id
+	if (!id) {
+		throw new Boom('Cannot proceed: socket is not authenticated yet (creds.me.id is missing)', { statusCode: 401 })
+	}
+
+	return id
 }
 
 export const initAuthCreds = (): AuthenticationCreds => {

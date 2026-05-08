@@ -9,11 +9,38 @@ release oficial e, a partir deste ponto, **todas as mudanças são nossas**
 | | |
 |---|---|
 | **Projeto origem** | [WhiskeySockets/Baileys](https://github.com/WhiskeySockets/Baileys) |
-| **Tag / Release**  | `v7.0.0-rc.9` |
+| **Tag / Release**  | `v7.0.0-rc.9` (master sem novas releases tagged desde 2025-11) |
 | **Licença**        | MIT (mantida — ver `LICENSE`) |
 | **Data do import** | 2026-04-23 |
 | **Escopo**         | Código `src/`, `WAProto/`, `proto-extract/`, tsconfigs. |
 | **Import anterior** | v6.7.21 @ `15b6247ccf7dabd9d4db9ae055121170881f8ea1` (2026-04-22) |
+| **Cherry-picks recentes** | 5 commits do master — ver "Histórico de cherry-picks" abaixo |
+
+## Histórico de cherry-picks (sem re-import completo)
+
+Quando o master Baileys avança sem release tagged, aplicamos cherry-picks
+controlados pra absorver bugfixes críticos em vez de re-importar tudo.
+Cada cherry-pick vira PATCH-NNN no `PATCHES.md`.
+
+### Round 1 — 2026-05-06 (5 commits absorvidos do master @ 2e421bc97a)
+
+| Commit upstream | Nosso PATCH | Descrição |
+|---|---|---|
+| `1453b06b` | PATCH-022 | Pin `music-metadata` em 11.12.1+ (TS declarations) |
+| `8ca9316a` | PATCH-018 | JID validation em `updateBlockStatus` |
+| `798f2a93` | PATCH-019 | Null/undefined hardening (5 arquivos) |
+| `0956f51f` | PATCH-020 | App state sync skip undecryptable (parcial) |
+| `3730684e` | PATCH-021 | Memory leak cleanup no socket end (9 arquivos) |
+
+**Não aplicados nesta rodada (e por quê):**
+- `bd68f1a0` — QR regression em `companion-reg-client-utils.ts`. Não temos o
+  arquivo (feature `de80aab1` ainda não absorvida).
+- `ac90a2d7` — App state resilience WA Web. Depende de infra ausente
+  (`whatsapp-rust-bridge`, helpers como `isMissingKeyError`).
+
+**33 commits do master pulados** porque são features novas que precisariam
+re-import completo, ou patches em áreas que já cobrimos via PATCHes 011-017
+não documentados (ver `PATCHES.md`).
 
 ## O que foi REMOVIDO do upstream no import
 

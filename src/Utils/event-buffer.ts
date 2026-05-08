@@ -61,6 +61,8 @@ type BaileysBufferableEventEmitter = BaileysEventEmitter & {
 	flush(): boolean
 	/** is there an ongoing buffer */
 	isBuffering(): boolean
+	/** [PATCH-021] cherry-pick Baileys 3730684e — destroy the event buffer, clearing all resources */
+	destroy(): void
 }
 
 /**
@@ -203,7 +205,26 @@ export const makeEventBuffer = (logger: ILogger): BaileysBufferableEventEmitter 
 		},
 		on: (...args) => ev.on(...args),
 		off: (...args) => ev.off(...args),
-		removeAllListeners: (...args) => ev.removeAllListeners(...args)
+		removeAllListeners: (...args) => ev.removeAllListeners(...args),
+		/**
+		 * [PATCH-021] cherry-pick Baileys 3730684e — destroy clears todos os
+		 * recursos do buffer (timeout, history cache, listeners). Chamado pelo
+		 * socket.end() handler. Adapter: nosso fork não tem `flushPendingTimeout`
+		 * (campo mais novo no master), pulamos esse clear.
+		 */
+		destroy() {
+			if (bufferTimeout) {
+				clearTimeout(bufferTimeout)
+				bufferTimeout = null
+			}
+
+			historyCache.clear()
+			data = makeBufferData()
+			isBuffering = false
+			bufferCount = 0
+			ev.removeAllListeners()
+			logger.debug('Event buffer destroyed')
+		}
 	}
 }
 

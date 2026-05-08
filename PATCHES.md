@@ -244,3 +244,222 @@ Formato de cada entrada:
 - **Origem:** WhiskeySockets/Baileys @ `v7.0.0-rc.9` tag.
 
 ---
+
+## PATCH-008..017: Patches pós-v7 não documentados (dívida histórica)
+
+- **Data:** entre 2026-04-23 e 2026-05-05
+- **Status:** marcadores `[PATCH-NNN]` presentes no código, sem entrada em
+  PATCHES.md. Aplicados após o upgrade pra v7 mas a doc não foi atualizada.
+- **Mapeamento (inferido por inspeção):**
+  - **PATCH-008** (`Utils/messages.ts:218`) — audio waveform fix; PTT bitrate.
+  - **PATCH-009** (15 refs) — tc-token (TrustedContact) sync. Arquivos:
+    `Types/Auth.ts`, `Utils/tc-token-utils.ts`, `Utils/index.ts`,
+    `Socket/messages-recv.ts`, `Socket/messages-send.ts`. Relacionado a
+    incorporação nativa de tc-token no v7.
+  - **PATCH-011** (2 refs) — `Socket/messages-recv.ts`. Função desconhecida.
+  - **PATCH-012** (6 refs) — `Socket/messages-recv.ts`. Função desconhecida.
+  - **PATCH-013** (9 refs) — `Utils/identity-change.ts` (novo arquivo) +
+    `Socket/messages-recv.ts`. Identity-change handler unificado, port
+    direto do Baileys master. Relacionado a tc-token reissue.
+  - **PATCH-014** (3 refs) — `Socket/messages-recv.ts`. Função desconhecida.
+  - **PATCH-015** (5 refs) — `Types/GroupMetadata.ts` + `Socket/messages-recv.ts`.
+    Mudanças em meta de grupos.
+  - **PATCH-016** (7 refs) — `Utils/history.ts` + `Utils/process-message.ts`.
+    Persistência de pares LID↔PN extraídos de history sync conversations.
+    Crítico: sem isso, primeira campanha pós-pareamento batia em LID errado.
+  - **PATCH-017** (2 refs) — `Types/Message.ts` + `Utils/messages.ts`.
+- **Risco:** baixo (já em produção há semanas). Documentar foi adiado mas
+  o código está estável.
+- **Recomendação:** quando alguém tocar uma dessas áreas, completar a doc
+  daquele patch específico. Não retroagir tudo de uma vez.
+
+---
+
+## PATCH-018: cherry-pick Baileys 8ca9316a — JID validation em `updateBlockStatus`
+
+- **Data:** 2026-05-06
+- **Arquivos:** `src/Socket/chats.ts`
+- **Motivação:** o servidor WA passou a exigir tanto `jid` (LID) quanto
+  `pn_jid` (PN) no item da blocklist quando action='block'. Sem isso, o
+  servidor devolvia `bad-request` opaco. Esse cherry-pick valida o JID,
+  resolve o par PN↔LID via `signalRepository.lidMapping`, e monta o
+  payload corretamente.
+- **Mudança:** adiciona helpers `isHostedLidUser`/`isHostedPnUser` ao
+  import de `WABinary`, e expande `updateBlockStatus` com:
+  - jid normalize via `jidNormalizedUser`
+  - resolve LID↔PN bidirecional
+  - throw `Boom 400` em jids malformados ou sem mapping
+  - monta `itemAttrs` com `pn_jid` somente em block (unblock só precisa de jid)
+- **Origem:** WhiskeySockets/Baileys @ `8ca9316a` (master HEAD em 2026-05-06).
+- **Risco:** baixo. Função era quebrada antes (sempre dava bad-request);
+  agora funciona conforme o servidor espera. Não usamos updateBlockStatus
+  em produção ainda, mas vai estar correto quando precisarmos.
+- **Manutenção:** se o servidor mudar protocolo de blocklist, esse helper
+  precisa atualizar. Atualmente segue WA Web 1:1.
+
+---
+
+## PATCH-019: cherry-pick Baileys 798f2a93 — Null/undefined hardening
+
+- **Data:** 2026-05-06
+- **Arquivos:**
+  - `src/Utils/auth-utils.ts` — adiciona `assertMeId(creds)` helper
+  - `src/Socket/messages-send.ts` — usa `assertMeId` em `relayMessage`
+  - `src/Socket/groups.ts` — null check em `extractGroupMetadata` com
+    surface de erro do servidor
+  - `src/Utils/decode-wa-message.ts` — null check de `msgId`/`from`,
+    remove operadores `!` redundantes
+  - `src/Utils/process-message.ts` — null check em `getChatId`
+- **Motivação:** vários `!` não-checados quebravam com `TypeError` opaco
+  quando socket caía antes do auth completar, OU quando server devolvia
+  payload incompleto. Agora throws Boom com mensagem descritiva — fica
+  rastreável no logger pino.
+- **Mudanças destacadas:**
+  - `assertMeId(creds)` lança `Boom 401` se `creds.me?.id` é null/empty.
+  - `extractGroupMetadata` lê `<error>` node do servidor e propaga
+    code+text em vez de TypeError. Mirror WAWeb behavior.
+  - `decodeMessageNode` rejeita stanza sem `id` ou `from` no início.
+  - `getChatId` rejeita key sem `remoteJid`.
+- **Origem:** WhiskeySockets/Baileys @ `798f2a93`.
+- **Risco:** baixo. Substitui crashes opacos por erros descritivos. Se
+  algo lançava `TypeError` antes, agora lança `Boom` — o caller que
+  catch genérico continua funcionando.
+- **Manutenção:** se algum dia decidirmos que stanza malformado deve ser
+  silenciosamente ignorado em vez de throw, mudar a semântica nesses 5
+  pontos. Hoje preferimos fail-loud.
+
+---
+
+## PATCH-020: cherry-pick Baileys 0956f51f — App state sync skip undecryptable (parcial)
+
+- **Data:** 2026-05-06
+- **Arquivos:**
+  - `src/Utils/chat-utils.ts` — try/catch em record-level decode
+  - `src/Socket/chats.ts` — passa `logger` pra `decodeSyncdSnapshot`
+  - `src/WAUSync/USyncQuery.ts` — null-safe simplification
+- **Motivação:** quando o app-state sync trazia 1 record corrompido
+  (server-side bug, replication race), o decode antigo dava throw que
+  derrubava todo o snapshot — ~30 records perdidos por 1 poisoned. Agora
+  skip-and-continue por record + soft-fail no LTHash MAC mismatch.
+- **Mudanças:**
+  - `decodeSyncdMutations`: HMAC mismatch e AES decrypt failure agora
+    `continue` em vez de throw.
+  - `decodeSyncdSnapshot`: aceita `logger?` opcional. LTHash mismatch
+    vira warn em vez de throw (alinhado com `decodePatches` que já tinha
+    tratamento similar).
+  - `decodePatches`: try/catch em torno de `decodeSyncdPatch` — patch
+    corrompido vira warn + skip; LTHash mismatch vira warn + break.
+  - `parseUSyncQueryResult`: simplifica null check via optional chaining.
+- **Adaptação ao nosso fork:** o cherry-pick original usa um helper
+  `isMissingKeyError` pra distinguir missing-key (propagate) vs corrupted
+  record (skip). Não temos esse helper — pulamos o try/catch do
+  `getKey` (mantém comportamento atual de propagar). Os outros 2 pontos
+  (HMAC, AES) ganharam o skip.
+- **Hunk pulado:** `src/Signal/libsignal.ts` modifica uma função
+  `signalStorage` mais complexa que não temos (nosso fork tem implementação
+  simplificada com `isTrustedIdentity: () => true`). Sem aplicabilidade.
+- **Origem:** WhiskeySockets/Baileys @ `0956f51f`.
+- **Risco:** baixo-médio. Mudança passa de fail-fast pra fail-soft em
+  alguns pontos. Se um record corrompido tinha valor crítico, antes você
+  descobria pelo crash; agora descobre pelo log warn. Aceitável dado
+  que o crash matava sessão inteira.
+- **Manutenção:** se aparecer log "skipping" recorrente, investigar a
+  origem do corrupted record (pode ser bug nosso, não do server).
+
+---
+
+## PATCH-021: cherry-pick Baileys 3730684e — Memory leak cleanup no socket end
+
+- **Data:** 2026-05-06
+- **Arquivos:**
+  - `src/Types/Socket.ts` — adiciona `close?: () => void` em CacheStore
+  - `src/Types/Signal.ts` — adiciona `close?` em SignalRepositoryWithLIDStore
+  - `src/Signal/lid-mapping.ts` — adiciona `close()` no LIDMappingStore
+  - `src/Signal/libsignal.ts` — adiciona `close()` no makeLibSignalRepository
+  - `src/Utils/message-retry-manager.ts` — adiciona `clear()`
+  - `src/Utils/event-buffer.ts` — adiciona `destroy()`
+  - `src/Socket/socket.ts` — registry `socketEndHandlers` + chama no `end()`
+  - `src/Socket/messages-send.ts` — registra cleanup de mediaConn/caches
+  - `src/Socket/messages-recv.ts` — registra cleanup de retry/offer/identity caches
+  - `src/Socket/chats.ts` — registra cleanup de awaitingSyncTimeout/syncState/privacy
+- **Motivação:** rodamos múltiplas instâncias 24/7 (multi-tenant). Cada
+  socket close deixava órfãos em memória: LRU caches, NodeCache instances,
+  retry maps, event buffer history, timers pendentes. Em workspace ativo
+  com reconnects frequentes, RSS subia ~80MB/dia sem teto. Esse fix
+  centraliza um registry de end-handlers e garante release no close.
+- **Mudanças destacadas:**
+  - `socket.ts` ganhou `socketEndHandlers: Array<(error) => void|Promise<void>>`
+    + função `registerSocketEndHandler` exposta no return de `makeSocket`.
+  - `end()` virou `async` — chama `signalRepository.close?.()`, depois
+    cada handler em sequência (com try/catch tolerante), depois
+    `ev.destroy()`.
+  - 3 subsistemas (chats, messages-recv, messages-send) registram
+    seus cleanups no startup. Cada um sabe quais caches limpar.
+  - Conditional close: se `config.userDevicesCache` (etc) foi passado
+    pelo caller, NÃO fechamos — caller é dono daquela memória.
+- **Adaptações ao nosso fork:**
+  - `MessageRetryManager.clear()` não inclui `baseKeys.clear()` (campo
+    do master que ainda não absorvemos).
+  - `event-buffer.destroy()` não inclui `flushPendingTimeout` (campo
+    do master que ainda não absorvemos).
+  - Não exportamos `placeholderResendCache` no return do `makeChatsSocket`
+    nem mudamos a propagação config — preservamos o setup atual e só
+    registramos o cleanup handler do cache.
+  - `messages-recv` continua criando seu próprio `placeholderResendCache`
+    fallback se config não tem; registro só fecha o cache se internalmente
+    criado.
+- **Origem:** WhiskeySockets/Baileys @ `3730684e`.
+- **Risco:** médio. Toca em 9 arquivos no caminho crítico de socket
+  lifecycle. Validado por typecheck e smoke de boot. Em produção,
+  monitorar RSS pós-reconnect: se cair como esperado, sucesso.
+- **Manutenção:** quando absorvermos `baseKeys` ou `flushPendingTimeout`
+  do master no futuro, completar os clear/destroy aqui.
+
+---
+
+## PATCH-022: pin music-metadata em 11.12.1+
+
+- **Data:** 2026-05-06
+- **Arquivos:** `package.json`
+- **Motivação:** cherry-pick de Baileys `1453b06b`. Pin de versão pra
+  pegar o fix de TypeScript declarations que veio em 11.12.1.
+- **Mudança:** `"music-metadata": "^11.7.0"` → `"music-metadata": "11.12.1"`.
+- **Origem:** WhiskeySockets/Baileys @ `1453b06b`.
+- **Risco:** baixo. Versão usada: 11.12.3 (patch dentro do range).
+- **Followup possível:** com TS declarations corretas em 11.12.1+,
+  podemos eventualmente remover o stub manual de `music-metadata` em
+  `src/typings/baileys-patches.d.ts`. Adiado por segurança — hoje o
+  stub não atrapalha.
+
+---
+
+## ac90a2d7 — App state resilience (WA Web verified) — **NÃO APLICADO**
+
+- **Data da análise:** 2026-05-06
+- **Por que pulamos:** o cherry-pick depende de:
+  1. Helpers `ensureLTHashStateVersion`, `isAppStateSyncIrrecoverable`,
+     `isMissingKeyError` que ainda não absorvemos do master
+  2. Dependência `whatsapp-rust-bridge` que não temos (e não pretendemos
+     adicionar agora — é experimental)
+  3. Infra de SyncState completa com Paused/Stalled states que veio em
+     commits posteriores que não foram cherry-picked
+- **Aplicar parcialmente** seria adicionar `HISTORY_SYNC_PAUSED_TIMEOUT_MS`
+  (constante isolada) sem o handler que a consome — dead code.
+- **Quando reconsiderar:** quando o master cortar uma release tagged
+  (rc.10+) e fizermos um re-import controlado seguindo o `UPSTREAM.md`.
+  Aí absorvemos o pacote inteiro de helpers + feature.
+
+---
+
+## bd68f1a0 — QR regression in companion-reg-client-utils — **NÃO APLICADO**
+
+- **Data da análise:** 2026-05-06
+- **Por que pulamos:** o arquivo `src/Utils/companion-reg-client-utils.ts`
+  não existe no nosso fork. A feature inteira de companion-registration
+  foi adicionada em `de80aab1` (master, 2026-05-02) — *depois* do nosso
+  último import. O bug que `bd68f1a0` corrige veio com a feature, então
+  não temos o bug porque não temos a feature.
+- **Quando reconsiderar:** quando absorvermos `de80aab1` (companion
+  registration utilities) numa onda futura, aplicar `bd68f1a0` junto.
+
+---

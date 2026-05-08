@@ -73,4 +73,6 @@ export type SignalRepository = {
 // Optimized repository with pre-loaded LID mapping store
 export interface SignalRepositoryWithLIDStore extends SignalRepository {
 	lidMapping: LIDMappingStore
+	/** [PATCH-021] cherry-pick Baileys 3730684e — release in-memory caches no socket close */
+	close?: () => void
 }
