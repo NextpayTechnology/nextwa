@@ -119,9 +119,15 @@ export const addTransactionCapability = (
 ): SignalKeyStoreWithTransaction => {
 	const txStorage = new AsyncLocalStorage<TransactionContext>()
 
-	// Queues for concurrency control
+	// Queues for concurrency control (keyed by signal data type - bounded set)
 	const keyQueues = new Map<string, PQueue>()
+	// [PATCH-039] cherry-pick Baileys rc10 — Transaction mutexes com reference
+	// counting pra cleanup. Antes `txMutexes` crescia indefinidamente em
+	// workspaces com muitas keys únicas (sender JIDs em campanhas grandes),
+	// vazando memória. Agora cada `transaction(key, ...)` faz acquire/release;
+	// quando refCount cai pra 0 E mutex não está locked, deletamos a entrada.
 	const txMutexes = new Map<string, Mutex>()
+	const txMutexRefCounts = new Map<string, number>()
 
 	// Pre-key manager for specialized operations
 	const preKeyManager = new PreKeyManager(state, logger)
@@ -143,9 +149,38 @@ export const addTransactionCapability = (
 	function getTxMutex(key: string): Mutex {
 		if (!txMutexes.has(key)) {
 			txMutexes.set(key, new Mutex())
+			txMutexRefCounts.set(key, 0)
 		}
 
 		return txMutexes.get(key)!
+	}
+
+	/**
+	 * [PATCH-039] Acquire a reference to a transaction mutex. Pair com
+	 * `releaseTxMutexRef` num try/finally.
+	 */
+	function acquireTxMutexRef(key: string): void {
+		const count = txMutexRefCounts.get(key) ?? 0
+		txMutexRefCounts.set(key, count + 1)
+	}
+
+	/**
+	 * [PATCH-039] Release a reference to a transaction mutex and cleanup if no
+	 * longer needed. Deleta entrada APENAS quando refCount ≤ 0 E mutex não
+	 * está locked (defensivo contra race com transação concorrente).
+	 */
+	function releaseTxMutexRef(key: string): void {
+		const count = (txMutexRefCounts.get(key) ?? 1) - 1
+		txMutexRefCounts.set(key, count)
+
+		// Cleanup if no more references and mutex is not locked
+		if (count <= 0) {
+			const mutex = txMutexes.get(key)
+			if (mutex && !mutex.isLocked()) {
+				txMutexes.delete(key)
+				txMutexRefCounts.delete(key)
+			}
+		}
 	}
 
 	/**
@@ -279,30 +314,39 @@ export const addTransactionCapability = (
 				return work()
 			}
 
-			// New transaction - acquire mutex and create context
-			return getTxMutex(key).runExclusive(async () => {
-				const ctx: TransactionContext = {
-					cache: {},
-					mutations: {},
-					dbQueries: 0
-				}
+			// [PATCH-039] cherry-pick Baileys rc10 — New transaction with
+			// reference counting. Acquire ref ANTES de entrar no runExclusive,
+			// release no finally — garante cleanup mesmo em throw.
+			const mutex = getTxMutex(key)
+			acquireTxMutexRef(key)
 
-				logger.trace('entering transaction')
+			try {
+				return await mutex.runExclusive(async () => {
+					const ctx: TransactionContext = {
+						cache: {},
+						mutations: {},
+						dbQueries: 0
+					}
 
-				try {
-					const result = await txStorage.run(ctx, work)
+					logger.trace('entering transaction')
 
-					// Commit mutations
-					await commitWithRetry(ctx.mutations)
+					try {
+						const result = await txStorage.run(ctx, work)
 
-					logger.trace({ dbQueries: ctx.dbQueries }, 'transaction completed')
+						// Commit mutations
+						await commitWithRetry(ctx.mutations)
 
-					return result
-				} catch (error) {
-					logger.error({ error }, 'transaction failed, rolling back')
-					throw error
-				}
-			})
+						logger.trace({ dbQueries: ctx.dbQueries }, 'transaction completed')
+
+						return result
+					} catch (error) {
+						logger.error({ error }, 'transaction failed, rolling back')
+						throw error
+					}
+				})
+			} finally {
+				releaseTxMutexRef(key)
+			}
 		}
 	}
 }

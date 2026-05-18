@@ -1,7 +1,7 @@
 import NodeCache from '@cacheable/node-cache'
 import { Boom } from '@hapi/boom'
 import { proto } from '../../WAProto/index.js'
-import { DEFAULT_CACHE_TTLS, PROCESSABLE_HISTORY_TYPES } from '../Defaults'
+import { DEFAULT_CACHE_TTLS, HISTORY_SYNC_PAUSED_TIMEOUT_MS, PROCESSABLE_HISTORY_TYPES } from '../Defaults'
 import type {
 	BotListInfo,
 	CacheStore,
@@ -92,6 +92,19 @@ export const makeChatsSocket = (config: SocketConfig) => {
 
 	// Timeout for AwaitingInitialSync state
 	let awaitingSyncTimeout: NodeJS.Timeout | undefined
+
+	// [PATCH-040] cherry-pick Baileys rc10 — history sync completion tracking.
+	// Reset on reconnection. Permite emit do evento `messaging-history.status`
+	// quando completion explícita (progress=100) ou implícita (timeout 120s
+	// sem chunks novos).
+	//
+	// Anti-detect: WA Web SEMPRE rastreia milestones de history sync e UI
+	// reage. Cliente que NÃO emite os status fica detectable por timing/UX.
+	const historySyncStatus = {
+		initialBootstrapComplete: false,
+		recentSyncComplete: false
+	}
+	let historySyncPausedTimeout: NodeJS.Timeout | undefined
 
 	const placeholderResendCache =
 		config.placeholderResendCache ||
@@ -778,7 +791,11 @@ export const makeChatsSocket = (config: SocketConfig) => {
 		if (tag === 'presence') {
 			presence = {
 				lastKnownPresence: attrs.type === 'unavailable' ? 'unavailable' : 'available',
-				lastSeen: attrs.last && attrs.last !== 'deny' ? +attrs.last : undefined
+				lastSeen: attrs.last && attrs.last !== 'deny' ? +attrs.last : undefined,
+				// [PATCH-036] cherry-pick Baileys rc10 — `count` attr de presence
+				// agrupa contagem de membros online em grupos. Parsing antes era
+				// dropped silenciosamente — WA Web SEMPRE captura.
+				groupOnlineCount: attrs.count ? +attrs.count : undefined
 			}
 		} else if (Array.isArray(content)) {
 			const [firstChild] = content
@@ -1110,6 +1127,65 @@ export const makeChatsSocket = (config: SocketConfig) => {
 				PROCESSABLE_HISTORY_TYPES.includes(historyMsg.syncType! as proto.HistorySync.HistorySyncType)
 			: false
 
+		// [PATCH-040] cherry-pick Baileys rc10 — milestone tracking de history
+		// sync. Emite `messaging-history.status` quando:
+		//   - INITIAL_BOOTSTRAP chega (mesmo sem progress=100, fire imediato)
+		//   - RECENT com progress=100 (completion explícita)
+		//   - RECENT sem chunks novos por 120s (completion implícita via timeout)
+		// Callers podem fechar UI loaders, commit final state, etc.
+		if (historyMsg && shouldProcessHistoryMsg) {
+			const syncType = historyMsg.syncType as proto.HistorySync.HistorySyncType
+
+			// INITIAL_BOOTSTRAP — fire imediato, sem checar progress (mirror WA Web).
+			if (
+				syncType === proto.HistorySync.HistorySyncType.INITIAL_BOOTSTRAP &&
+				!historySyncStatus.initialBootstrapComplete
+			) {
+				historySyncStatus.initialBootstrapComplete = true
+				ev.emit('messaging-history.status', {
+					syncType,
+					status: 'complete',
+					explicit: true
+				})
+			}
+
+			// RECENT com progress === 100 — completion explícita.
+			if (
+				syncType === proto.HistorySync.HistorySyncType.RECENT &&
+				historyMsg.progress === 100 &&
+				!historySyncStatus.recentSyncComplete
+			) {
+				historySyncStatus.recentSyncComplete = true
+				if (historySyncPausedTimeout) {
+					clearTimeout(historySyncPausedTimeout)
+					historySyncPausedTimeout = undefined
+				}
+				ev.emit('messaging-history.status', {
+					syncType,
+					status: 'complete',
+					explicit: true
+				})
+			}
+
+			// Reset 120s paused timeout em qualquer chunk RECENT (mirror WA Web
+			// handleChunkProgress). Se nenhum chunk vier por 120s, emite
+			// 'paused' (completion implícita).
+			if (syncType === proto.HistorySync.HistorySyncType.RECENT && !historySyncStatus.recentSyncComplete) {
+				if (historySyncPausedTimeout) clearTimeout(historySyncPausedTimeout)
+				historySyncPausedTimeout = setTimeout(() => {
+					if (!historySyncStatus.recentSyncComplete) {
+						historySyncStatus.recentSyncComplete = true
+						ev.emit('messaging-history.status', {
+							syncType: proto.HistorySync.HistorySyncType.RECENT,
+							status: 'paused',
+							explicit: false
+						})
+					}
+					historySyncPausedTimeout = undefined
+				}, HISTORY_SYNC_PAUSED_TIMEOUT_MS)
+			}
+		}
+
 		// State machine: decide on sync and flush
 		if (historyMsg && syncState === SyncState.AwaitingInitialSync) {
 			if (awaitingSyncTimeout) {
@@ -1255,6 +1331,15 @@ export const makeChatsSocket = (config: SocketConfig) => {
 			clearTimeout(awaitingSyncTimeout)
 			awaitingSyncTimeout = undefined
 		}
+
+		// [PATCH-040] clear history sync paused timeout no socket-end + reset
+		// status pra que próxima conexão re-emita milestones corretamente.
+		if (historySyncPausedTimeout) {
+			clearTimeout(historySyncPausedTimeout)
+			historySyncPausedTimeout = undefined
+		}
+		historySyncStatus.initialBootstrapComplete = false
+		historySyncStatus.recentSyncComplete = false
 
 		if (!config.placeholderResendCache && placeholderResendCache.close) {
 			placeholderResendCache.close()

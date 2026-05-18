@@ -149,4 +149,48 @@ export type SocketConfig = {
 		logger: ILogger,
 		pnToLIDFunc?: (jids: string[]) => Promise<LIDMapping[] | undefined>
 	) => SignalRepositoryWithLIDStore
+
+	/**
+	 * [PATCH-031] Anti-detection — overrides opcionais do User-Agent enviado no
+	 * `<iq>` / handshake. WhatsApp Web envia esses campos refletindo o sistema
+	 * REAL do usuário (osVersion, mnc/mcc da SIM, idioma do device). Defaults
+	 * hardcoded (`osVersion='0.1'`, `mnc='000'`, `mcc='000'`, `localeLanguageIso6391='en'`)
+	 * são telltale de cliente automatizado.
+	 *
+	 * O caller (instância) pode passar overrides realistas pra reduzir
+	 * correlação cruzada entre instâncias e parecer mais com WA Web genuíno.
+	 *
+	 * Sugestão pra contas BR:
+	 *   { osVersion: '14.5', device: 'Desktop', osBuildNumber: '23F79',
+	 *     localeLanguageIso6391: 'pt', mnc: '05', mcc: '724' }  // Vivo BR
+	 *
+	 * Operadoras BR (mcc=724):
+	 *   Vivo  → 724/06, Claro → 724/05, TIM → 724/04, Oi → 724/16, Nextel → 724/00
+	 *
+	 * Quando NÃO fornecido, mantemos os defaults antigos (zero breaking change).
+	 */
+	userAgentOverrides?: {
+		osVersion?: string
+		device?: string
+		osBuildNumber?: string
+		localeLanguageIso6391?: string
+		mnc?: string
+		mcc?: string
+	}
+
+	/**
+	 * [PATCH-031] Anti-detection — override de `DeviceProps.version` enviado no
+	 * `<iq>` de pairing. WA Web atualiza essa versão periodicamente; nosso fork
+	 * hardcoda `{10, 15, 7}` que envelhece. Caller pode bumpar conforme a
+	 * versão atual do WA Web — sem precisar republish da wa-core.
+	 *
+	 * Default mantém 10.15.7 quando override não fornecido.
+	 */
+	deviceProps?: {
+		version?: {
+			primary: number
+			secondary: number
+			tertiary: number
+		}
+	}
 }

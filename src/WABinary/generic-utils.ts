@@ -4,12 +4,41 @@ import { type BinaryNode } from './types'
 
 // some extra useful utilities
 
-export const getBinaryNodeChildren = (node: BinaryNode | undefined, childTag: string) => {
-	if (Array.isArray(node?.content)) {
-		return node.content.filter(item => item.tag === childTag)
-	}
+/**
+ * [PATCH-023] cherry-pick Baileys rc10 (purpshell) — WeakMap cache pra getBinaryNodeChildren
+ * + getBinaryNodeChild. Stanzas binários com muitas children + lookups repetidos pela MESMA
+ * tag (ex.: `participants` em group fanout) faziam Array.filter linear cada vez. Em mensagens
+ * pra grupos grandes ou stanzas de history-sync, o lookup repetido virava 30% do CPU de send/recv.
+ *
+ * WeakMap garante GC: quando o BinaryNode sai de escopo (parsed stanza descartado), o mapa
+ * de tag→children some junto. Sem refs longas, sem leak de memória.
+ *
+ * Inner Map: tag (string) → cached array de children. Lazy fill — só popula quando chamado.
+ * Lookup miss: roda o filter original, salva em cache, retorna.
+ */
+type BinaryChildrenCacheEntry = Map<string, BinaryNode[]>
+const binaryChildrenCache = new WeakMap<BinaryNode, BinaryChildrenCacheEntry>()
 
-	return []
+function getOrInitChildrenCache(node: BinaryNode): BinaryChildrenCacheEntry {
+	let entry = binaryChildrenCache.get(node)
+	if (!entry) {
+		entry = new Map()
+		binaryChildrenCache.set(node, entry)
+	}
+	return entry
+}
+
+export const getBinaryNodeChildren = (node: BinaryNode | undefined, childTag: string) => {
+	if (!node || !Array.isArray(node.content)) return []
+
+	// [PATCH-023] cache hit-path. WeakMap chaveada pelo node, inner Map pela tag.
+	const cache = getOrInitChildrenCache(node)
+	const hit = cache.get(childTag)
+	if (hit) return hit
+
+	const filtered = node.content.filter(item => item.tag === childTag)
+	cache.set(childTag, filtered)
+	return filtered
 }
 
 export const getAllBinaryNodeChildren = ({ content }: BinaryNode) => {
@@ -21,9 +50,15 @@ export const getAllBinaryNodeChildren = ({ content }: BinaryNode) => {
 }
 
 export const getBinaryNodeChild = (node: BinaryNode | undefined, childTag: string) => {
-	if (Array.isArray(node?.content)) {
-		return node?.content.find(item => item.tag === childTag)
-	}
+	if (!node || !Array.isArray(node.content)) return undefined
+
+	// [PATCH-023] reusa o cache de children pra encontrar o primeiro. O cost é o mesmo
+	// (children já filtrados), mas evita re-scan quando alguém chamou getBinaryNodeChildren
+	// pra mesma tag antes (caso super comum em messages-recv.ts).
+	const cached = binaryChildrenCache.get(node)?.get(childTag)
+	if (cached) return cached[0]
+
+	return node.content.find(item => item.tag === childTag)
 }
 
 export const getBinaryNodeChildBuffer = (node: BinaryNode | undefined, childTag: string) => {

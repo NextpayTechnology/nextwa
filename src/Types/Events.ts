@@ -1,6 +1,6 @@
 import type { Boom } from '@hapi/boom'
 import { proto } from '../../WAProto/index.js'
-import type { AuthenticationCreds } from './Auth'
+import type { AuthenticationCreds, LIDMapping } from './Auth'
 import type { WACallEvent } from './Call'
 import type { Chat, ChatUpdate, PresenceData } from './Chat'
 import type { Contact } from './Contact'
@@ -14,7 +14,9 @@ import type {
 import type { Label } from './Label'
 import type { LabelAssociation } from './LabelAssociation'
 import type { MessageUpsertType, MessageUserReceiptUpdate, WAMessage, WAMessageKey, WAMessageUpdate } from './Message'
-import type { ConnectionState } from './State'
+// [PATCH-035/037] cherry-pick Baileys rc10 — types pra novos eventos.
+// NewChatMessageCapInfo agora vem de State.ts (shape completo).
+import type { ConnectionState, NewChatMessageCapInfo } from './State'
 
 // TODO: refactor this mess
 export type BaileysEventMap = {
@@ -32,11 +34,36 @@ export type BaileysEventMap = {
 		syncType?: proto.HistorySync.HistorySyncType | null
 		peerDataRequestSessionId?: string | null
 	}
+	/**
+	 * [PATCH-035] cherry-pick Baileys rc10 — signals history sync milestones
+	 * (completion or stall) per sync type. Caller pode usar pra fechar UI loaders
+	 * com timeout natural (paused after 120s) ou commit final ('complete').
+	 *
+	 * Anti-detect: WA Web SEMPRE emite esses status — sem isso, fingerprint
+	 * de "cliente que não trackeia history sync state" é detectável.
+	 */
+	'messaging-history.status': {
+		/** which sync phase this status refers to */
+		syncType: proto.HistorySync.HistorySyncType
+		/** the status of this sync phase */
+		status: 'complete' | 'paused'
+		/**
+		 * progress === 100 was received from the server.
+		 * when false, completion was inferred via timeout (no more chunks arriving).
+		 */
+		explicit: boolean
+	}
 	/** upsert chats */
 	'chats.upsert': Chat[]
 	/** update the given chats */
 	'chats.update': ChatUpdate[]
-	'lid-mapping.update': { lid: string; pn: string }
+	/**
+	 * [PATCH-035] cherry-pick Baileys rc10 — payload migrado de `{ lid; pn }`
+	 * para o type `LIDMapping`. Estruturalmente equivalente (LIDMapping
+	 * em Types/Auth.ts é `{ lid: string; pn: string }`); typecast manual
+	 * só é necessário pra callers que destruturam fields adicionais futuros.
+	 */
+	'lid-mapping.update': LIDMapping
 	/** delete chats with given ID */
 	'chats.delete': string[]
 	/** presence of contact in a chat updated */
@@ -96,6 +123,62 @@ export type BaileysEventMap = {
 	'newsletter.view': { id: string; server_id: string; count: number }
 	'newsletter-participants.update': { id: string; author: string; user: string; new_role: string; action: string }
 	'newsletter-settings.update': { id: string; update: any }
+
+	/**
+	 * [PATCH-035] cherry-pick Baileys rc10 — update das labels de um
+	 * participante em grupo. Disparado quando admin altera tag de membro
+	 * via app mobile.
+	 */
+	'group.member-tag.update': {
+		groupId: string
+		participant: string
+		participantAlt?: string
+		label: string
+		messageTimestamp?: number
+	}
+
+	/**
+	 * [PATCH-035] cherry-pick Baileys rc10 — update do estado de message
+	 * capping (anti-spam rate-limit aplicado pela Meta). Quando WA percebe
+	 * que a conta está enviando muitas mensagens novas, envia este update
+	 * com info de quanto restou da janela.
+	 *
+	 * Anti-detect: caller pode pausar campanhas quando `remaining < N` em
+	 * vez de continuar disparando e tomar NACK 463 em cascata.
+	 */
+	'message-capping.update': NewChatMessageCapInfo
+
+	/**
+	 * [PATCH-035] cherry-pick Baileys rc10 — chat foi locked/unlocked
+	 * (proteção por código no app mobile). Caller pode esconder UI quando
+	 * locked=true.
+	 */
+	'chats.lock': { id: string; locked: boolean }
+
+	/**
+	 * [PATCH-035] cherry-pick Baileys rc10 — settings sync events (mudanças
+	 * em prefs do app mobile como locale, time format, privacy). Union
+	 * discriminada simples — caller faz switch em `setting`.
+	 *
+	 * Type signatures dos `value` referenciam protos via `any` pra evitar
+	 * dependência circular com WAProto. Caller pode cast pra type específico
+	 * conforme o setting.
+	 */
+	'settings.update':
+		| { setting: 'unarchiveChats'; value: boolean }
+		| { setting: 'locale'; value: string }
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		| { setting: 'disableLinkPreviews'; value: any }
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		| { setting: 'timeFormat'; value: any }
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		| { setting: 'privacySettingRelayAllCalls'; value: any }
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		| { setting: 'statusPrivacy'; value: any }
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		| { setting: 'notificationActivitySetting'; value: any }
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		| { setting: 'channelsPersonalisedRecommendation'; value: any }
 }
 
 export type BufferedEventData = {

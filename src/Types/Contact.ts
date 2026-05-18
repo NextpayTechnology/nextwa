@@ -9,6 +9,11 @@ export interface Contact {
 	name?: string
 	/** name of the contact, the contact has set on their own on WA */
 	notify?: string
+	/** [PATCH-028] cherry-pick Baileys rc10 — username associated with this contact,
+	 *  when provided by WA. Aparece em contactAction (app-state sync) e em outros
+	 *  paths que normalizamos via processContactAction. Adicionado pra que LID/PN
+	 *  mappings via contactAction não percam o `username`. */
+	username?: string
 	/** I have no idea */
 	verifiedName?: string
 	// Baileys Added

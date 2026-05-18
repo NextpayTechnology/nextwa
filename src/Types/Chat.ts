@@ -36,6 +36,14 @@ export type WAPatchName = (typeof ALL_WA_PATCH_NAMES)[number]
 export interface PresenceData {
 	lastKnownPresence: WAPresence
 	lastSeen?: number
+	/**
+	 * [PATCH-036] cherry-pick Baileys rc10 — número de membros online em grupos.
+	 * Aparece em `<presence type="composing" count="X">` quando WA agrega
+	 * presença de múltiplos participantes do mesmo grupo. WA Web emite isso
+	 * sempre; sem o campo, fingerprint detectável de cliente que não trackeia
+	 * online state em grupos.
+	 */
+	groupOnlineCount?: number
 }
 
 export type BotListInfo = {

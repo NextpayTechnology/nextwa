@@ -30,6 +30,8 @@ import {
 	getNextPreKeysNode,
 	makeEventBuffer,
 	makeNoiseHandler,
+	// [PATCH-024] ServerClock — track skew via <success t=...>
+	makeServerClock,
 	promiseTimeout,
 	signedKeyPair,
 	xmppSignedPreKey
@@ -364,6 +366,11 @@ export const makeSocket = (config: SocketConfig) => {
 	let qrTimer: NodeJS.Timeout
 	let closed = false
 
+	// [PATCH-024] ServerClock — atualizado em CB:success com node.attrs.t. Tokens
+	// e timestamps wire-level usam server-aligned time pra reduzir fingerprint
+	// de drift de relógio host. Per-socket (cada conexão tem seu próprio skew).
+	const serverClock = makeServerClock(logger)
+
 	/**
 	 * [PATCH-021] cherry-pick Baileys 3730684e — registry de end handlers.
 	 * Cada subsistema (chats, messages-recv, messages-send) registra um cleanup
@@ -559,7 +566,7 @@ export const makeSocket = (config: SocketConfig) => {
 			const shouldUpload = lowServerCount || missingCurrentPreKey
 
 			if (shouldUpload) {
-				const reasons = []
+				const reasons: string[] = []
 				if (lowServerCount) reasons.push(`server count low (${preKeyCount})`)
 				if (missingCurrentPreKey) reasons.push(`current prekey ${currentPreKeyId} missing from storage`)
 
@@ -927,6 +934,10 @@ export const makeSocket = (config: SocketConfig) => {
 	})
 	// login complete
 	ws.on('CB:success', async (node: BinaryNode) => {
+		// [PATCH-024] capture server time ANTES de qualquer IQ — assim os IQs que
+		// seguem (preKeys, digest, passive) já usam server-aligned `t`.
+		serverClock.updateFromSuccessAttr(node.attrs.t as string | undefined)
+
 		try {
 			await uploadPreKeysToServerIfRequired()
 			await sendPassiveIq('active')
@@ -1072,6 +1083,10 @@ export const makeSocket = (config: SocketConfig) => {
 		sendNode,
 		logout,
 		end,
+		// [PATCH-024] expõe pra messages-send.ts usar server-aligned time em
+		// `<receipt t=...>`, `<tctoken t=...>`, `<iq xmlns=privacy>` e demais
+		// stanzas time-stamped. Cai pra Date.now() se skew ainda não medido.
+		serverClock,
 		// [PATCH-021] cherry-pick Baileys 3730684e — exposed pra subsistemas registrarem cleanup
 		registerSocketEndHandler: (handler: (error: Error | undefined) => void | Promise<void>) => {
 			socketEndHandlers.push(handler)

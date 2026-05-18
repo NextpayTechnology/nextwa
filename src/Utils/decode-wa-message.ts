@@ -51,6 +51,10 @@ const storeMappingFromEnvelope = async (
 
 export const NO_MESSAGE_FOUND_ERROR_TEXT = 'Message absent from node'
 export const MISSING_KEYS_ERROR_TEXT = 'Key used already or never filled'
+/** [PATCH-033] cherry-pick Baileys rc10 — error text vindo do server quando
+ *  a conta foi restringida (anti-fraud action da Meta). Aparece como atributo
+ *  em ACKs com error 463. Constante reservada pra tooling/diagnóstico. */
+export const ACCOUNT_RESTRICTED_TEXT = 'Your account has been restricted'
 
 // Retry configuration for failed decryption
 export const DECRYPTION_RETRY_CONFIG = {
@@ -59,7 +63,13 @@ export const DECRYPTION_RETRY_CONFIG = {
 	sessionRecordErrors: ['No session record', 'SessionError: No session record']
 }
 
+/** NACK reason codes we send to the server (client → server) */
 export const NACK_REASONS = {
+	// [PATCH-033] cherry-pick Baileys rc10 — reachout timelock: quando o
+	// server informa que a conta-destino está temporariamente "locked" pra
+	// novas conversas (reachout limit do Meta anti-abuse). Cliente que envia
+	// 1:1 sem token via NACK 463 sinaliza ao server que reconheceu.
+	SenderReachoutTimelocked: 463,
 	ParsingError: 487,
 	UnrecognizedStanza: 488,
 	UnrecognizedStanzaClass: 489,
@@ -74,6 +84,29 @@ export const NACK_REASONS = {
 	UnsupportedLIDGroup: 551,
 	DBOperationFailed: 552
 }
+
+/**
+ * [PATCH-033] cherry-pick Baileys rc10 — Server-side error codes returned
+ * in ack stanzas (server → client) that we currently have dedicated handlers
+ * for. Extend as more handlers are added. Distinct from the client-side
+ * NackReason enum (WAWebCreateNackFromStanza).
+ *
+ * MOTIVAÇÃO: nosso fork não reconhecia esses códigos antes — logs apareciam
+ * como "unknown error" e tratamento default era retry/fail silencioso.
+ * Reconhecer 463/479 explicitamente permite que callers distinguam
+ * "account restricted" (parar de enviar, criar alerta) vs "stale session"
+ * (re-criar sessão Signal e retentar).
+ */
+export const SERVER_ERROR_CODES = {
+	/**
+	 * 1:1 message missing privacy token (tctoken). Usually means the account is
+	 * restricted: WhatsApp blocks starting new chats but preserves existing ones,
+	 * since established chats already carry a tctoken.
+	 */
+	MessageAccountRestriction: '463',
+	/** Stanza validation failure (SMAX_INVALID) — likely stale device session */
+	SmaxInvalid: '479'
+} as const
 
 type MessageType =
 	| 'chat'

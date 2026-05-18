@@ -14,6 +14,11 @@ import { encodeBigEndian } from './generics'
 import { createSignalIdentity } from './signal'
 
 const getUserAgent = (config: SocketConfig): proto.ClientPayload.IUserAgent => {
+	// [PATCH-031] Anti-detection — pegar overrides do config.userAgentOverrides
+	// quando fornecidos. Defaults antigos (placeholder/SIM-de-teste) ficam só
+	// como fallback pra retrocompat. Recomendado: caller passar valores realistas
+	// — ver SocketConfig.userAgentOverrides pro shape esperado e sugestões BR.
+	const o = config.userAgentOverrides
 	return {
 		appVersion: {
 			primary: config.version[0],
@@ -22,13 +27,13 @@ const getUserAgent = (config: SocketConfig): proto.ClientPayload.IUserAgent => {
 		},
 		platform: proto.ClientPayload.UserAgent.Platform.WEB,
 		releaseChannel: proto.ClientPayload.UserAgent.ReleaseChannel.RELEASE,
-		osVersion: '0.1',
-		device: 'Desktop',
-		osBuildNumber: '0.1',
-		localeLanguageIso6391: 'en',
+		osVersion: o?.osVersion ?? '0.1',
+		device: o?.device ?? 'Desktop',
+		osBuildNumber: o?.osBuildNumber ?? '0.1',
+		localeLanguageIso6391: o?.localeLanguageIso6391 ?? 'en',
 
-		mnc: '000',
-		mcc: '000',
+		mnc: o?.mnc ?? '000',
+		mcc: o?.mcc ?? '000',
 		localeCountryIso31661Alpha2: config.countryCode
 	}
 }
@@ -95,6 +100,14 @@ export const generateRegistrationNode = (
 		.update(config.version.join('.')) // join as string
 		.digest()
 
+	// [PATCH-031] Anti-detection — version do DeviceProps overridable pelo caller.
+	// Default mantém 10.15.7 quando não fornecido (retrocompat).
+	const dpVersion = config.deviceProps?.version ?? {
+		primary: 10,
+		secondary: 15,
+		tertiary: 7
+	}
+
 	const companion: proto.IDeviceProps = {
 		os: config.browser[0],
 		platformType: getPlatformType(config.browser[1]),
@@ -116,11 +129,7 @@ export const generateRegistrationNode = (
 			onDemandReady: undefined,
 			supportGuestChat: undefined
 		},
-		version: {
-			primary: 10,
-			secondary: 15,
-			tertiary: 7
-		}
+		version: dpVersion
 	}
 
 	const companionProto = proto.DeviceProps.encode(companion).finish()

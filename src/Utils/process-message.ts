@@ -34,6 +34,11 @@ import { aesDecryptGCM, hmacSign } from './crypto'
 import { getKeyAuthor, toNumber } from './generics'
 import { downloadAndProcessHistorySyncNotification } from './history'
 import type { ILogger } from './logger'
+// [PATCH-041] cherry-pick Baileys rc10 — helpers pra persistir TC tokens
+// extraídos do history sync. Sem isso, perdemos tokens que vêm em
+// `Chat.tcToken` no histórico inicial — primeira msg pra contato existente
+// no histórico pode sair sem token (até a próxima notification refresh).
+import { buildMergedTcTokenIndexWrite, resolveTcTokenJid } from './tc-token-utils'
 
 type ProcessMessageContext = {
 	shouldProcessHistoryMsg: boolean
@@ -55,6 +60,76 @@ const REAL_MSG_STUB_TYPES = new Set([
 ])
 
 const REAL_MSG_REQ_ME_STUB_TYPES = new Set([WAMessageStubType.GROUP_PARTICIPANT_ADD])
+
+/**
+ * [PATCH-041] cherry-pick Baileys rc10 — persiste TC tokens encontrados em
+ * `Chat.tcToken` durante history sync inicial. Sem isso, contatos que JÁ
+ * tinham conversa no histórico (1:1 antigo) mas cujo token nunca chegou
+ * via `<notification type=privacy_token>` ficavam sem token no nosso
+ * `tctoken` store, e a primeira msg pós-pareamento saía SEM token →
+ * fingerprint de bot.
+ *
+ * Filtra candidates pelo timestamp: se já temos token mais recente em
+ * cache, mantém. Append-only — preserva tokens existentes.
+ */
+async function storeTcTokensFromHistorySync(
+	chats: Chat[],
+	signalRepository: SignalRepositoryWithLIDStore,
+	keyStore: SignalKeyStoreWithTransaction,
+	logger?: ILogger
+) {
+	const getLIDForPN = signalRepository.lidMapping.getLIDForPN.bind(signalRepository.lidMapping)
+
+	const candidates: { storageJid: string; token: Buffer; ts: number; senderTs?: number }[] = []
+	for (const chat of chats) {
+		const ts = chat.tcTokenTimestamp ? toNumber(chat.tcTokenTimestamp) : 0
+		if (chat.tcToken?.length && ts > 0) {
+			const jid = jidNormalizedUser(chat.id!)
+			const storageJid = await resolveTcTokenJid(jid, getLIDForPN)
+			candidates.push({
+				storageJid,
+				token: Buffer.from(chat.tcToken),
+				ts,
+				senderTs: chat.tcTokenSenderTimestamp ? toNumber(chat.tcTokenSenderTimestamp) : undefined
+			})
+		}
+	}
+
+	if (!candidates.length) {
+		return
+	}
+
+	const jids = candidates.map(c => c.storageJid)
+	const existing = await keyStore.get('tctoken', jids)
+	const entries: Record<string, { token: Buffer; timestamp?: string; senderTimestamp?: number }> = {}
+
+	for (const c of candidates) {
+		const existingEntry = existing[c.storageJid]
+		const existingTs = existingEntry?.timestamp ? Number(existingEntry.timestamp) : 0
+		// Skip se já temos token mais recente em cache.
+		if (existingTs > 0 && existingTs >= c.ts) {
+			continue
+		}
+
+		entries[c.storageJid] = {
+			...existingEntry,
+			token: c.token,
+			timestamp: String(c.ts),
+			...(c.senderTs !== undefined ? { senderTimestamp: c.senderTs } : {})
+		}
+	}
+
+	if (Object.keys(entries).length) {
+		logger?.debug({ count: Object.keys(entries).length }, '[PATCH-041] storing tctokens from history sync')
+		try {
+			// Inclui __index merged pra que cross-session pruning encontre as JIDs.
+			const indexWrite = await buildMergedTcTokenIndexWrite(keyStore, Object.keys(entries))
+			await keyStore.set({ tctoken: { ...entries, ...indexWrite } })
+		} catch (err) {
+			logger?.warn({ err }, '[PATCH-041] failed to store tctokens from history sync')
+		}
+	}
+}
 
 /** Cleans a received message to further processing */
 export const cleanMessage = (message: WAMessage, meId: string, meLid: string) => {
@@ -316,6 +391,11 @@ const processMessage = async (
 						}
 					}
 
+					// [PATCH-041] persiste TC tokens encontrados em `Chat.tcToken` no
+					// histórico. ANTES do emit pra que callers downstream que façam
+					// fetchMessages já encontrem tokens válidos no store.
+					await storeTcTokensFromHistorySync(data.chats, signalRepository, keyStore, logger)
+
 					// `lidPnPairs` é detalhe interno do util — não polui o event público.
 					const { lidPnPairs: _omit, ...emitData } = data
 					ev.emit('messaging-history.set', {
@@ -410,12 +490,29 @@ const processMessage = async (
 					}
 				])
 				break
+			case proto.Message.ProtocolMessage.Type.GROUP_MEMBER_LABEL_CHANGE:
+				// [PATCH-041] cherry-pick Baileys rc10 — emit `group.member-tag.update`
+				// quando admin altera label de membro em grupo via app mobile.
+				// Cliente que ignora isto fica out-of-sync com o estado real do grupo.
+				{
+					const labelAssociationMsg = (protocolMsg as { memberLabel?: { label?: string } }).memberLabel
+					if (labelAssociationMsg?.label) {
+						ev.emit('group.member-tag.update', {
+							groupId: chat.id!,
+							label: labelAssociationMsg.label,
+							participant: message.key.participant!,
+							participantAlt: (message.key as { participantAlt?: string }).participantAlt,
+							messageTimestamp: Number(message.messageTimestamp)
+						})
+					}
+				}
+				break
 			case proto.Message.ProtocolMessage.Type.LID_MIGRATION_MAPPING_SYNC:
 				const encodedPayload = protocolMsg.lidMigrationMappingSyncMessage?.encodedMappingPayload!
 				const { pnToLidMappings, chatDbMigrationTimestamp } =
 					proto.LIDMigrationMappingSyncPayload.decode(encodedPayload)
 				logger?.debug({ pnToLidMappings, chatDbMigrationTimestamp }, 'got lid mappings and chat db migration timestamp')
-				const pairs = []
+				const pairs: LIDMapping[] = []
 				for (const { pn, latestLid, assignedLid } of pnToLidMappings) {
 					const lid = latestLid || assignedLid
 					pairs.push({ lid: `${lid}@lid`, pn: `${pn}@s.whatsapp.net` })

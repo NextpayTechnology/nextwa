@@ -16,6 +16,8 @@ import type {
 	WAPatchName
 } from '../Types'
 import { WAMessageStatus, WAMessageStubType } from '../Types'
+// [PATCH-038] cherry-pick Baileys rc10 — types pra antifraud mex notifications
+import { type NewChatMessageCapInfo, ReachoutTimelockEnforcementType } from '../Types/State'
 import {
 	aesDecryptCTR,
 	aesEncryptGCM,
@@ -191,6 +193,107 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 	}
 
 	// Handles mex newsletter notifications
+	/**
+	 * [PATCH-038] cherry-pick Baileys rc10 — handler pra notifications mex
+	 * GraphQL no formato NOVO (data wrapper com opName). Cobre:
+	 *   - NotificationUserReachoutTimelockUpdate → emit connection.update
+	 *     com `reachoutTimeLock` populado (cliente pausa campanhas)
+	 *   - MessageCappingInfoNotification → emit `message-capping.update`
+	 *     com info de quota de novas conversas
+	 *
+	 * Retorna `true` se reconheceu/processou o opName; `false` pra que o
+	 * caller delegue pro legacy newsletter handler. Mantém retrocompat
+	 * total com fluxo de newsletter ops antigo.
+	 */
+	const handleMexAntifraudNotification = (node: BinaryNode): boolean => {
+		const mexNode = getBinaryNodeChild(node, 'mex')
+		if (!mexNode?.content) return false
+
+		let parsed: Record<string, unknown>
+		try {
+			const text = typeof mexNode.content === 'string'
+				? mexNode.content
+				: Buffer.from(mexNode.content as Uint8Array).toString('utf-8')
+			parsed = JSON.parse(text)
+		} catch {
+			return false
+		}
+
+		// Formato NOVO do Baileys rc10:
+		//   { data: { __typename: 'XwaOpRoot', xwa2_notify_xxx: {...} }, errors: ... }
+		// Formato LEGADO (newsletter):
+		//   { operation: 'NotificationNewsletterXxx', updates: [...] }
+		// Se for legado, retornamos false pra que o caller delegue.
+		const data = parsed?.data as Record<string, unknown> | undefined
+		if (!data || typeof data !== 'object') return false
+
+		// Identifica opName via __typename (Baileys rc10) ou fallback por
+		// presença de payload key específica (defensivo).
+		const opName = (data.__typename as string | undefined)
+			?? (data.xwa2_notify_account_reachout_timelock ? 'NotificationUserReachoutTimelockUpdate' : undefined)
+			?? (data.xwa2_notify_new_chat_messages_capping_info_update ? 'MessageCappingInfoNotification' : undefined)
+
+		if (!opName) return false
+
+		switch (opName) {
+			case 'NotificationUserReachoutTimelockUpdate':
+			case 'XwaOpRoot':
+				if (data.xwa2_notify_account_reachout_timelock) {
+					handleReachoutTimelockNotification(data.xwa2_notify_account_reachout_timelock as Record<string, unknown>)
+					return true
+				}
+				if (data.xwa2_notify_new_chat_messages_capping_info_update) {
+					handleMessageCappingNotification(data.xwa2_notify_new_chat_messages_capping_info_update as Record<string, unknown>)
+					return true
+				}
+				return false
+
+			case 'MessageCappingInfoNotification':
+				if (data.xwa2_notify_new_chat_messages_capping_info_update) {
+					handleMessageCappingNotification(data.xwa2_notify_new_chat_messages_capping_info_update as Record<string, unknown>)
+					return true
+				}
+				return false
+
+			default:
+				return false
+		}
+	}
+
+	const handleReachoutTimelockNotification = (payload: Record<string, unknown>) => {
+		const isActive = payload.is_active === true
+		if (!isActive) {
+			logger.info({ instanceUser: authState.creds.me?.id }, 'reachout timelock restriction lifted')
+			ev.emit('connection.update', {
+				reachoutTimeLock: { isActive: false, enforcementType: ReachoutTimelockEnforcementType.DEFAULT }
+			})
+			return
+		}
+
+		// WA Web default: now+60s quando o server omite expiry
+		const tEndsRaw = payload.time_enforcement_ends
+		const timeEnforcementEnds = tEndsRaw && typeof tEndsRaw === 'string'
+			? new Date(parseInt(tEndsRaw, 10) * 1000)
+			: new Date(Date.now() + 60_000)
+
+		const rawEnforcement = typeof payload.enforcement_type === 'string' ? payload.enforcement_type : undefined
+		const enforcementType = rawEnforcement && (Object.values(ReachoutTimelockEnforcementType) as string[]).includes(rawEnforcement)
+			? rawEnforcement as ReachoutTimelockEnforcementType
+			: ReachoutTimelockEnforcementType.DEFAULT
+
+		logger.info({ enforcementType, timeEnforcementEnds }, 'reachout timelock restriction set')
+		ev.emit('connection.update', {
+			reachoutTimeLock: { isActive: true, timeEnforcementEnds, enforcementType }
+		})
+	}
+
+	const handleMessageCappingNotification = (payload: Record<string, unknown>) => {
+		logger.info({ payload }, 'received message capping update')
+		// Cast: payload do server respeita shape NewChatMessageCapInfo definido
+		// em Types/State.ts. Campos opcionais — usar `as` é seguro aqui.
+		ev.emit('message-capping.update', payload as NewChatMessageCapInfo)
+	}
+
 	const handleMexNewsletterNotification = async (node: BinaryNode) => {
 		const mexNode = getBinaryNodeChild(node, 'mex')
 		if (!mexNode?.content) {
@@ -794,7 +897,12 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 				await handleNewsletterNotification(node)
 				break
 			case 'mex':
-				await handleMexNewsletterNotification(node)
+				// [PATCH-038] tenta antifraud handler primeiro (capping/reachout
+				// timelock). Se reconhecer, sai. Senão, delega pro legacy
+				// newsletter handler. Mantém compat total com newsletter ops.
+				if (!handleMexAntifraudNotification(node)) {
+					await handleMexNewsletterNotification(node)
+				}
 				break
 			case 'w:gp2':
 				// TODO: HANDLE PARTICIPANT_PN

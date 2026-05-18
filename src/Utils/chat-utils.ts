@@ -80,7 +80,16 @@ const to64BitNetworkOrder = (e: number) => {
 
 type Mac = { indexMac: Uint8Array; valueMac: Uint8Array; operation: proto.SyncdMutation.SyncdOperation }
 
-const makeLtHashGenerator = ({ indexValueMap, hash }: Pick<LTHashState, 'hash' | 'indexValueMap'>) => {
+// [PATCH-042] cherry-pick Baileys rc10 — `makeLtHashGenerator` exportado.
+// Antes era privado ao módulo; subsistemas externos que precisam aplicar
+// LT hash em patch chunks (ex.: validators, recovery) usavam workarounds
+// (re-implementar a função). Exportar é zero-risk e zero-breaking.
+//
+// NOTA: nossa versão é async (depende de WebCrypto hkdf), upstream migrou
+// pra sync usando `whatsapp-rust-bridge` (lib opcional Rust). Mantemos
+// async — não vamos adicionar Rust bridge agora (dep pesada, risco alto
+// vs ganho marginal).
+export const makeLtHashGenerator = ({ indexValueMap, hash }: Pick<LTHashState, 'hash' | 'indexValueMap'>) => {
 	indexValueMap = { ...indexValueMap }
 	const addBuffs: ArrayBuffer[] = []
 	const subBuffs: ArrayBuffer[] = []

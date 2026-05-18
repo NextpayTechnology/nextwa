@@ -19,6 +19,9 @@ import {
 	bindWaitForEvent,
 	// [PATCH-009] tc-token utilities — emissão semanal + LID resolve + expiry math.
 	buildMergedTcTokenIndexWrite,
+	// [PATCH-025] CS Token fallback quando não há TC token vigente.
+	CsTokenGenerator,
+	resolvePrivacyTokenNode,
 	decryptMediaRetryData,
 	encodeNewsletterMessage,
 	encodeSignedDeviceIdentity,
@@ -93,7 +96,9 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 		groupMetadata,
 		groupToggleEphemeral,
 		// [PATCH-021] cherry-pick Baileys 3730684e — registry de cleanup pós-end
-		registerSocketEndHandler
+		registerSocketEndHandler,
+		// [PATCH-024] ServerClock — alinhado com server time via <success t=...>
+		serverClock
 	} = sock
 
 	// [PATCH-009] Helpers e estado pra tc-token sync.
@@ -113,6 +118,9 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 	const getLIDForPN = signalRepository.lidMapping.getLIDForPN.bind(signalRepository.lidMapping)
 	const getPNForLID = signalRepository.lidMapping.getPNForLID.bind(signalRepository.lidMapping)
 	const inFlightTcTokenIssuance = new Set<string>()
+	// [PATCH-025] CS Token generator — per-socket. Cache LRU bounded em 5 entries
+	// pra acomodar coexistence/multi-account sem leak.
+	const csTokenGenerator = new CsTokenGenerator()
 	const serverProps = {
 		privacyTokenOn1to1: true,
 		profilePicPrivacyToken: true,
@@ -194,7 +202,9 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 		}
 		const isReadReceipt = type === 'read' || type === 'read-self'
 		if (isReadReceipt) {
-			node.attrs.t = unixTimestampSeconds().toString()
+			// [PATCH-024] usar server-aligned time pra que `<receipt t=...>` bata com
+			// o relógio que o server tem — drift de NTP/host não envenena a stamp.
+			node.attrs.t = serverClock.nowSeconds().toString()
 		}
 
 		if (type === 'sender' && (isPnUser(jid) || isLidUser(jid))) {
@@ -1055,6 +1065,29 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 					attrs: {},
 					content: tcTokenBuffer
 				})
+			} else if (is1on1Send && serverProps.privacyTokenOn1to1) {
+				// [PATCH-025] CS Token fallback — quando NÃO temos TC token cacheado
+				// pro destinatário (primeira mensagem, expirado, etc), tentamos
+				// anexar `<cstoken>` derivado de HMAC(nctSalt, meLid). Sem isso, o
+				// stanza saía sem NENHUM token de privacy — fingerprint de bot.
+				// Só executa se:
+				//   1) NCT salt presente no storage (gravado por handler de wire)
+				//   2) creds.me.lid presente (conta já tem LID associado)
+				// Senão é no-op silencioso = comportamento de antes (preserva
+				// compat até identificarmos 100% a wire do salt).
+				try {
+					const csNode = await resolvePrivacyTokenNode(
+						undefined,
+						authState.creds,
+						csTokenGenerator,
+						authState.keys
+					)
+					if (csNode) {
+						;(stanza.content as BinaryNode[]).push(csNode)
+					}
+				} catch (err) {
+					logger.debug({ jid: destinationJid, err: String(err) }, '[PATCH-025] cs-token fallback failed')
+				}
 			}
 
 			if (additionalNodes && additionalNodes.length > 0) {
@@ -1130,7 +1163,10 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 				!inFlightTcTokenIssuance.has(tcTokenJid)
 			) {
 				inFlightTcTokenIssuance.add(tcTokenJid)
-				const issueTimestamp = unixTimestampSeconds()
+				// [PATCH-024] server-aligned — IMPORTANTE pra TC token. WA buckets
+				// tokens por 7d a partir do `t` que enviamos; com drift host>5s, o
+				// bucket pode desalinhar com o do server → reissue duplicado/falho.
+				const issueTimestamp = serverClock.nowSeconds()
 				resolveIssuanceJid(destinationJid, serverProps.lidTrustedTokenIssueToLid, getLIDForPN, getPNForLID)
 					.then(issueJid => issuePrivacyTokens([issueJid], issueTimestamp))
 					.then(async result => {
@@ -1225,7 +1261,8 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 	}
 
 	const getPrivacyTokens = async (jids: string[]) => {
-		const t = unixTimestampSeconds().toString()
+		// [PATCH-024] server-aligned timestamp
+		const t = serverClock.nowSeconds().toString()
 		const result = await query({
 			tag: 'iq',
 			attrs: {
@@ -1261,7 +1298,8 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 	 * pra preservar API existente.
 	 */
 	const issuePrivacyTokens = async (jids: string[], timestamp?: number) => {
-		const t = (timestamp ?? unixTimestampSeconds()).toString()
+		// [PATCH-024] server-aligned timestamp quando não passar explícito
+		const t = (timestamp ?? serverClock.nowSeconds()).toString()
 		const result = await query({
 			tag: 'iq',
 			attrs: {
